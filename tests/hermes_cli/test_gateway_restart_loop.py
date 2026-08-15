@@ -871,3 +871,113 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+class TestLifecycleGuardNeverRaises:
+    # NOTE (tbc.7 backport): upstream's NUL-byte/oversized-path hardening lands in
+    # 70de95892, which is not on this release line, so the two tests covering it
+    # (test_magic_prefix_binaries_skipped_without_full_read,
+    # test_check_gateway_lifecycle_adversarial_script_values) are omitted here.
+    """The guard must return a verdict for every input — binary referenced
+    paths, NUL bytes, non-UTF-8, /dev/* nodes, directories, missing files —
+    never crash (the live 'ValueError: embedded null byte' class)."""
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    def test_command_referencing_elf_binary_returns_false(self, tmp_path):
+        """The exact live crash shape: a command referencing a compiled
+        executable path (e.g. a venv python) must scan as 'nothing', not
+        crash on the binary's decoded bytes."""
+        binary = tmp_path / "python3.11"
+        binary.write_bytes(b"\x7fELF\x02\x01\x01" + bytes(64) + b"\x90" * 256)
+        assert self._scan(f"{binary} -m json.tool /tmp/x.json") is False
+
+    @pytest.mark.parametrize("command", [
+        "run /tmp/foo\x00bar/baz.sh",
+        "bash ./run\x00me.sh",
+        "bash /nonexistent/deeply/missing.sh",
+        "bash /" + "a" * 4096 + ".sh",  # ENAMETOOLONG
+    ])
+    def test_adversarial_paths_never_raise(self, command):
+        assert self._scan(command, cwd="/tmp") is False
+
+    def test_non_utf8_referenced_file_never_raises(self, tmp_path):
+        weird = tmp_path / "weird.sh"
+        weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
+        assert self._scan(f"bash {weird}") is False
+
+    def test_sourced_zshrc_docker_completions_dir_is_not_blocked(self, tmp_path):
+        """#86753: Docker Desktop writes ``fpath=(~/.docker/completions …)``
+        into ``.zshrc``. Completions is a directory. The walk must treat
+        that as nothing-to-scan, not fail-closed, or ``source ~/.zshrc``
+        is blocked on every terminal command."""
+        completions = tmp_path / ".docker" / "completions"
+        completions.mkdir(parents=True)
+        zshrc = tmp_path / ".zshrc"
+        zshrc.write_text(
+            f"fpath=({completions} /usr/local/share/zsh/site-functions $fpath)\n",
+            encoding="utf-8",
+        )
+        assert self._scan(f"source {zshrc}") is False
+
+    def test_multiline_python_code_directory_token_is_not_blocked(self, tmp_path):
+        """Alberto's Jinja syntax check must not look like a gateway restart.
+
+        The command segmenter sees the loader directory on a line by itself
+        inside ``python3 -c``. Directories are not referenced scripts and
+        therefore cannot contain a gateway lifecycle command.
+        """
+        templates = tmp_path / "blocktrades-ui-upgrade" / "templates"
+        templates.mkdir(parents=True)
+        command = f'''python3 -c "
+from jinja2 import Environment, FileSystemLoader
+env = Environment(loader=FileSystemLoader(
+{templates}
+))
+env.get_template('index.html')
+"'''
+        assert self._scan(command) is False
+
+    def test_fstat_directory_mode_is_not_unsafe(self, tmp_path, monkeypatch):
+        """#86753 Unix contract: os.open(dir) succeeds, fstat is not S_ISREG.
+
+        Windows raises OSError on os.open(dir) and already returns
+        nothing-to-scan. Linux/macOS open the directory and used to
+        return unsafe=True, blocking sourced zshrcs that mention
+        ``~/.docker/completions``.
+        """
+        import os
+        import stat as statmod
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        probe = tmp_path / "probe"
+        probe.write_text("echo hi\n", encoding="utf-8")
+        orig = os.fstat
+
+        def _dir_fstat(fd):
+            orig(fd)
+
+            class _DirStat:
+                st_mode = statmod.S_IFDIR | 0o755
+
+            return _DirStat()
+
+        monkeypatch.setattr(os, "fstat", _dir_fstat)
+        text, unsafe = _read_referenced_script(probe)
+        assert text is None
+        assert unsafe is False
+
+    def test_directory_allowed_and_dev_null_fail_closed(self, tmp_path):
+        # Directories are not scripts (#86753). Devices stay fail-closed
+        # where the OS actually exposes them (POSIX /dev/null).
+        # The important contract is: verdict, not exception.
+        assert self._scan(f"bash {tmp_path}") is False
+        if os.name != "nt":
+            assert self._scan("bash /dev/null") is True
