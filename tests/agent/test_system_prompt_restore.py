@@ -113,6 +113,64 @@ class TestStoredPromptReuse:
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
 
+    def test_missing_prompt_revision_rebuilds_and_persists(self, monkeypatch):
+        revision = "b" * 64
+        monkeypatch.setenv("AGENTSMITH_PROMPT_REVISION", revision)
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "Host: Linux\nUser home directory: /home/test\n"
+            "Model: test-model\n"
+            "Provider: openrouter\nPlatform: cli"
+        }
+        rebuilt = (
+            "Host: Linux\nUser home directory: /home/test\n"
+            f"AgentSmith prompt revision: {revision}\nModel: test-model\n"
+            "Provider: openrouter\nPlatform: cli"
+        )
+        agent = _make_agent(session_db=db, prebuilt_prompt=rebuilt)
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, rebuilt)
+
+    def test_matching_prompt_revision_reuses_stored_prompt(self, monkeypatch):
+        revision = "b" * 64
+        monkeypatch.setenv("AGENTSMITH_PROMPT_REVISION", revision)
+        stored = (
+            "Host: Linux\nUser home directory: /home/test\n"
+            f"AgentSmith prompt revision: {revision}\nModel: test-model\n"
+            "Provider: openrouter\nPlatform: cli"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
+    def test_different_prompt_revision_rebuilds(self, monkeypatch):
+        monkeypatch.setenv("AGENTSMITH_PROMPT_REVISION", "b" * 64)
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "AgentSmith prompt revision: " + "a" * 64
+        }
+        agent = _make_agent(session_db=db, prebuilt_prompt="NEW PROMPT")
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, "NEW PROMPT")
+
 
 # ---------------------------------------------------------------------------
 # Legitimate fresh-build paths (no history, no DB)

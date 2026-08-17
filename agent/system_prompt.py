@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -149,6 +150,42 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _agent_home(agent: Any) -> Optional[Path]:
+    """Resolve the agent's own home without relying on thread propagation."""
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if override:
+            return Path(override)
+    except Exception:
+        pass
+    try:
+        db = getattr(agent, "_session_db", None)
+        db_path = getattr(db, "db_path", None)
+        if db_path:
+            return Path(db_path).parent
+    except Exception:
+        pass
+    return None
+
+
+def _agent_skills_dir(agent: Any) -> Optional[Path]:
+    home = _agent_home(agent)
+    return home / "skills" if home is not None else None
+
+
+def _profile_name_for_home(home: Path) -> str:
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root()
+        relative = home.resolve().relative_to((root / "profiles").resolve())
+        return relative.parts[0] if relative.parts else "default"
+    except (ValueError, OSError):
+        return "default"
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -191,7 +228,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
+        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -322,6 +359,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            skills_dir_override=_agent_skills_dir(agent),
         )
     else:
         skills_prompt = ""
@@ -403,15 +441,30 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
+    agent_home = _agent_home(agent)
     try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
+        if agent_home is not None:
+            active_profile = _profile_name_for_home(agent_home)
+        else:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
+    if agent_home is not None:
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            root_home = get_default_hermes_root()
+        except Exception:
+            root_home = get_hermes_home()
+    else:
+        root_home = get_hermes_home()
+    home_text = str(agent_home if agent_home is not None else root_home)
+    root_text = str(root_home)
     if active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+            "under " + root_text + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
@@ -420,9 +473,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"and writes {home_text}/. The default "
+            f"profile's data lives at {root_text}/skills/, {root_text}/plugins/, "
+            f"{root_text}/cron/, {root_text}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
@@ -493,7 +546,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            home_override=_agent_home(agent))
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
@@ -537,6 +591,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
+    prompt_revision = (os.getenv("AGENTSMITH_PROMPT_REVISION") or "").strip()
+    if (
+        len(prompt_revision) in (40, 64)
+        and all(character in "0123456789abcdef" for character in prompt_revision)
+    ):
+        timestamp_line += f"\nAgentSmith prompt revision: {prompt_revision}"
     volatile_parts.append(timestamp_line)
 
     return {
