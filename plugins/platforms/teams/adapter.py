@@ -101,6 +101,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_media_bytes,
 )
+from hermes_constants import get_hermes_home
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -339,7 +340,13 @@ def _file_upload_status_path() -> Path:
 
 
 def _allowed_file_upload_roots() -> tuple[Path, ...]:
-    """Return the explicit operator-owned roots eligible for document delivery."""
+    """Return operator roots plus the active profile's document cache.
+
+    The generic MEDIA validator already treats ``cache/documents`` as the
+    profile-scoped artifact boundary. Mirror only the effective profile here;
+    never broaden Teams upload access to the shared jobs tree or sibling
+    profiles merely because the multiplex gateway can read them.
+    """
     configured = os.getenv("TEAMS_FILE_UPLOAD_ROOTS", "")
     roots = []
     for value in configured.split(os.pathsep):
@@ -352,6 +359,19 @@ def _allowed_file_upload_roots() -> tuple[Path, ...]:
             continue
         if root.is_dir() and not root.is_symlink():
             roots.append(root)
+    try:
+        profile_documents = (Path(get_hermes_home()) / "cache" / "documents").resolve(
+            strict=True
+        )
+    except OSError:
+        profile_documents = None
+    if (
+        profile_documents is not None
+        and profile_documents.is_dir()
+        and not profile_documents.is_symlink()
+        and profile_documents not in roots
+    ):
+        roots.append(profile_documents)
     return tuple(roots)
 
 

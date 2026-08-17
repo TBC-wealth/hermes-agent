@@ -1084,6 +1084,41 @@ class TestTeamsMediaAttachments:
         assert not result.success
         assert "roots" in result.error
 
+    @pytest.mark.asyncio
+    async def test_send_document_allows_only_active_profile_document_cache(
+        self, tmp_path, monkeypatch
+    ):
+        profile_home = tmp_path / "profiles" / "kyle"
+        documents = profile_home / "cache" / "documents"
+        documents.mkdir(parents=True)
+        sibling_documents = tmp_path / "profiles" / "alberto" / "cache" / "documents"
+        sibling_documents.mkdir(parents=True)
+        route_store = tmp_path / "conversations.json"
+        route_store.write_text(json.dumps({
+            "aad-456": {
+                "chat_id": "19:abc@thread.v2",
+                "service_url": "https://smba.trafficmanager.net/teams/",
+            }
+        }))
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(route_store))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(tmp_path / "pending.json"))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STATUS_STORE", str(tmp_path / "status.json"))
+        monkeypatch.delenv("TEAMS_FILE_UPLOAD_ROOTS")
+        monkeypatch.setattr(_teams_mod, "get_hermes_home", lambda: profile_home)
+        adapter = self._make_adapter()
+
+        own_document = documents / "report.pdf"
+        own_document.write_bytes(b"%PDF own profile")
+        result = await adapter.send_document("user:aad-456", str(own_document))
+        assert result.success
+        assert result.raw_response["deliveryStatus"] == "file_consent_requested"
+
+        sibling_document = sibling_documents / "private.pdf"
+        sibling_document.write_bytes(b"%PDF sibling profile")
+        result = await adapter.send_document("user:aad-456", str(sibling_document))
+        assert not result.success
+        assert "roots" in result.error
+
     def test_concurrent_upload_and_status_updates_do_not_lose_entries(self, tmp_path, monkeypatch):
         upload_store = tmp_path / "pending.json"
         status_store = tmp_path / "status.json"
