@@ -460,7 +460,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "teams",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -2521,13 +2521,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+        if task_name.startswith("pa-briefing-"):
+            # PA briefings are ordinary user-facing messages, not operator
+            # diagnostics. Keep their stable internal job name/id out of the
+            # conversation while retaining the legacy wrapper for other jobs.
+            username = task_name.removeprefix("pa-briefing-").replace("-", " ").title()
+            delivery_content = f"PA briefing {username}\n\n{content}"
+        else:
+            delivery_content = (
+                f"Cronjob Response: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{content}\n\n"
+                f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            )
     else:
         delivery_content = content
 
@@ -3790,7 +3797,10 @@ def _build_job_prompt(
         "DELIVERY: Your final response will be automatically delivered "
         "to the user — do NOT use send_message or try to deliver "
         "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
+        "final response and the system handles the rest. If the job names "
+        "another recipient, its configured delivery target already routes "
+        "your final response to that recipient; output the exact intended "
+        "message and never claim that a messaging tool is unavailable. "
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "

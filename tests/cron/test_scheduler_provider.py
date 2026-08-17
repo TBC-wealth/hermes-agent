@@ -640,3 +640,31 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_resets_timezone_cache_for_each_profile(tmp_path):
+    """A process-global timezone cache must never leak between profiles."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "profile-one"
+    p2 = tmp_path / "profile-two"
+    for directory in (p1, p2):
+        (directory / "cron").mkdir(parents=True)
+
+    reset_calls = []
+    stop = threading.Event()
+
+    def _tick_once(*args, **kwargs):
+        stop.set()
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=_tick_once), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None), \
+         patch("hermes_time.reset_cache", side_effect=lambda: reset_calls.append(1)):
+        InProcessCronScheduler().start(
+            stop,
+            interval=0,
+            profile_homes=[("one", p1), ("two", p2)],
+        )
+
+    # Initial recovery, one tick cycle, and heartbeat each enter/leave both
+    # profiles: four resets per phase.
+    assert len(reset_calls) == 12

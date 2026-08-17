@@ -288,6 +288,46 @@ def test_sensitive_env_files_hidden_from_listing(forced_files_client):
     assert ".env.prod" not in names
 
 
+def test_operator_root_is_shared_and_organized(forced_files_client):
+    client, root = forced_files_client
+
+    response = client.get("/api/files")
+
+    assert response.status_code == 200
+    assert response.json()["root"] == str(root)
+    assert [entry["name"] for entry in response.json()["entries"]] == [
+        "Archive", "Documents", "Uploads",
+    ]
+
+
+def test_ordinary_hidden_paths_are_omitted_and_unreadable(forced_files_client):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    visible = root / "visible.txt"
+    hidden = root / ".notes.txt"
+    visible.write_text("visible")
+    hidden.write_text("hidden")
+
+    listing = client.get("/api/files")
+
+    assert listing.status_code == 200
+    assert "visible.txt" in [entry["name"] for entry in listing.json()["entries"]]
+    assert ".notes.txt" not in [entry["name"] for entry in listing.json()["entries"]]
+    assert client.get("/api/files/read", params={"path": str(hidden)}).status_code == 403
+
+
+def test_operator_can_delete_managed_files(forced_files_client):
+    client, root = forced_files_client
+    target = _seed_file(client, root, "Documents/report.txt")
+
+    response = client.request(
+        "DELETE", "/api/files", json={"path": str(target), "recursive": False}
+    )
+
+    assert response.status_code == 200
+    assert not target.exists()
+
+
 
 
 
@@ -328,7 +368,7 @@ def test_other_credential_store_basenames_blocked(forced_files_client):
 
     listing = client.get("/api/files", params={"path": str(root)})
     names = [e["name"] for e in listing.json()["entries"]]
-    assert names == []
+    assert names == ["Archive", "Documents", "Uploads"]
 
 
 
@@ -373,5 +413,3 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     # is filtered because the parent component is a credential dir.
     mcp_listing = client.get("/api/files", params={"path": str(mcp_dir)})
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
-
-

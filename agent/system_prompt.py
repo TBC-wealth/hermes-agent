@@ -853,6 +853,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
+    prompt_revision = (os.getenv("AGENTSMITH_PROMPT_REVISION") or "").strip()
+    if (
+        len(prompt_revision) in (40, 64)
+        and all(character in "0123456789abcdef" for character in prompt_revision)
+    ):
+        timestamp_line += f"\nAgentSmith prompt revision: {prompt_revision}"
     volatile_parts.append(timestamp_line)
 
     return {

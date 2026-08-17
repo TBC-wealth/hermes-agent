@@ -17,6 +17,30 @@ import hermes_cli.gateway as gateway
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+def test_service_pid_discovery_includes_agentsmith_managed_gateway(monkeypatch):
+    """The multiplex production unit is a live Hermes gateway too."""
+    calls = []
+
+    def _run(args, **kwargs):
+        calls.append(args)
+        if "list-units" in args:
+            return SimpleNamespace(
+                stdout="agentsmith-hermes.service loaded active running AgentSmith\n",
+                returncode=0,
+            )
+        if "show" in args:
+            return SimpleNamespace(stdout="4242\n", returncode=0)
+        raise AssertionError(args)
+
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway.subprocess, "run", _run)
+
+    assert gateway._get_service_pids() == {4242}
+    list_calls = [call for call in calls if "list-units" in call]
+    assert all("agentsmith-hermes.service" in call for call in list_calls)
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway

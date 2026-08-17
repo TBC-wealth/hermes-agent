@@ -128,7 +128,7 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     await s.close()
 
 
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull
+from hermes_cli.pty_session import OwnerMismatch, PtySessionRegistry, RegistryFull
 
 
 def make_registry(ttl=1800.0, max_sessions=16):
@@ -145,6 +145,36 @@ async def test_same_key_reattaches_same_session():
     assert created1 is True and created2 is False
     assert s1 is s2
     assert s2.bridge is b1                     # second spawn callable was NOT used
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_same_attach_token_cannot_cross_live_owner():
+    reg = make_registry()
+    owner_a = ("session-a", "tenant", "alice")
+    owner_b = ("session-b", "tenant", "bob")
+    bridge = FakeBridge([b"", b""])
+    await reg.attach_or_spawn("tok", spawn=lambda: bridge, owner=owner_a)
+    with pytest.raises(OwnerMismatch):
+        await reg.attach_or_spawn(
+            "tok", spawn=lambda: FakeBridge([]), owner=owner_b
+        )
+    assert bridge.closed is False
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_close_matching_reaps_owned_process_tree_only():
+    reg = make_registry()
+    owner_a = ("session-a", "tenant", "alice")
+    owner_b = ("session-b", "tenant", "bob")
+    bridge_a = FakeBridge([b"", b""])
+    bridge_b = FakeBridge([b"", b""])
+    await reg.attach_or_spawn("a", spawn=lambda: bridge_a, owner=owner_a)
+    await reg.attach_or_spawn("b", spawn=lambda: bridge_b, owner=owner_b)
+    await reg.close_matching(lambda owner: owner == owner_a)
+    assert bridge_a.closed is True
+    assert bridge_b.closed is False
     await reg.close_all()
 
 

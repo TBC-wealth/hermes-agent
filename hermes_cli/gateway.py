@@ -116,6 +116,7 @@ def _get_service_pids() -> set:
                     + [
                         "list-units",
                         "hermes-gateway*",
+                        "agentsmith-hermes.service",
                         "--plain",
                         "--no-legend",
                         "--no-pager",

@@ -1382,11 +1382,20 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     ``delegate_task`` children keep sharing the parent's container via the
     alias registry (``register_container_alias``).
     """
+    prefix = ""
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if is_multiplex_active():
+            from hermes_cli.profiles import get_active_profile_name
+            prefix = f"profile:{get_active_profile_name() or 'default'}:"
+    except Exception:
+        # Existing single-profile behavior is the safe compatibility fallback.
+        prefix = ""
     if task_id and _has_isolation_overrides(task_id):
-        return task_id
+        return prefix + task_id
     if task_id and _docker_session_isolation_enabled():
-        return _resolve_container_alias(task_id)
-    return "default"
+        return prefix + _resolve_container_alias(task_id)
+    return prefix + "default"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:

@@ -1350,7 +1350,6 @@ def build_environment_hints() -> str:
             host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
         except OSError:
             pass
-
         if sys.platform == "win32" and not is_wsl():
             host_lines.append(
                 "Note: on Windows, the machine hostname (e.g. from `hostname` "

@@ -98,6 +98,24 @@ class TestSetupLogging:
         ]
         assert len(agent_handlers) == 1
 
+    def test_second_profile_does_not_receive_process_wide_logs(self, hermes_home):
+        root_home = hermes_home / "root"
+        profile_home = hermes_home / "profiles" / "alberto"
+        hermes_logging.setup_logging(hermes_home=root_home, mode="gateway")
+
+        handlers = [
+            Path(h.baseFilename)
+            for h in hermes_logging.rotating_file_handlers()
+        ]
+
+        hermes_logging.setup_logging(hermes_home=profile_home)
+
+        assert (
+            [Path(h.baseFilename) for h in hermes_logging.rotating_file_handlers()]
+            == handlers
+        )
+        assert not (profile_home / "logs").exists()
+
 
 
 
