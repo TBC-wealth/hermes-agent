@@ -1,8 +1,11 @@
 """Tests for the Microsoft Teams platform adapter plugin."""
 
+import asyncio
 import json
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +15,11 @@ import pytest
 from gateway.config import Platform, PlatformConfig, HomeChannel
 from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+
+@pytest.fixture(autouse=True)
+def _agent_file_upload_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEAMS_FILE_UPLOAD_ROOTS", str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -33,12 +41,22 @@ def _ensure_teams_mock():
     microsoft_teams_api_activities_invoke_adaptive_card = types.ModuleType(
         "microsoft_teams.api.activities.invoke.adaptive_card"
     )
+    microsoft_teams_api_activities_invoke_file_consent = types.ModuleType(
+        "microsoft_teams.api.activities.invoke.file_consent"
+    )
     microsoft_teams_common = types.ModuleType("microsoft_teams.common")
     microsoft_teams_common_http = types.ModuleType("microsoft_teams.common.http")
     microsoft_teams_common_http_client = types.ModuleType("microsoft_teams.common.http.client")
     microsoft_teams_api_models = types.ModuleType("microsoft_teams.api.models")
     microsoft_teams_api_models_adaptive_card = types.ModuleType("microsoft_teams.api.models.adaptive_card")
     microsoft_teams_api_models_invoke_response = types.ModuleType("microsoft_teams.api.models.invoke_response")
+    microsoft_teams_api_models_file = types.ModuleType("microsoft_teams.api.models.file")
+    microsoft_teams_api_models_file_consent = types.ModuleType(
+        "microsoft_teams.api.models.file.file_consent_card"
+    )
+    microsoft_teams_api_models_file_info = types.ModuleType(
+        "microsoft_teams.api.models.file.file_info_card"
+    )
     microsoft_teams_cards = types.ModuleType("microsoft_teams.cards")
     microsoft_teams_apps_http = types.ModuleType("microsoft_teams.apps.http")
     microsoft_teams_apps_http_adapter = types.ModuleType("microsoft_teams.apps.http.adapter")
@@ -62,6 +80,10 @@ def _ensure_teams_mock():
 
         def on_card_action(self, func):
             self._card_action_handler = func
+            return func
+
+        def on_file_consent(self, func):
+            self._file_consent_handler = func
             return func
 
         async def initialize(self):
@@ -96,6 +118,7 @@ def _ensure_teams_mock():
 
     # Adaptive card invoke activity mock
     microsoft_teams_api_activities_invoke_adaptive_card.AdaptiveCardInvokeActivity = MagicMock
+    microsoft_teams_api_activities_invoke_file_consent.FileConsentInvokeActivity = MagicMock
 
     # Adaptive card response mocks
     microsoft_teams_api_models_adaptive_card.AdaptiveCardActionCardResponse = MagicMock
@@ -109,6 +132,8 @@ def _ensure_teams_mock():
 
     microsoft_teams_api_models_invoke_response.InvokeResponse = MockInvokeResponse
     microsoft_teams_api_models_invoke_response.AdaptiveCardInvokeResponse = MagicMock
+    microsoft_teams_api_models_file_consent.FileConsentCard = MagicMock
+    microsoft_teams_api_models_file_info.FileInfoCard = MagicMock
 
     # Cards mocks
     class MockAdaptiveCard:
@@ -149,12 +174,16 @@ def _ensure_teams_mock():
         "microsoft_teams.api.activities.typing": microsoft_teams_api_activities_typing,
         "microsoft_teams.api.activities.invoke": microsoft_teams_api_activities_invoke,
         "microsoft_teams.api.activities.invoke.adaptive_card": microsoft_teams_api_activities_invoke_adaptive_card,
+        "microsoft_teams.api.activities.invoke.file_consent": microsoft_teams_api_activities_invoke_file_consent,
         "microsoft_teams.common": microsoft_teams_common,
         "microsoft_teams.common.http": microsoft_teams_common_http,
         "microsoft_teams.common.http.client": microsoft_teams_common_http_client,
         "microsoft_teams.api.models": microsoft_teams_api_models,
         "microsoft_teams.api.models.adaptive_card": microsoft_teams_api_models_adaptive_card,
         "microsoft_teams.api.models.invoke_response": microsoft_teams_api_models_invoke_response,
+        "microsoft_teams.api.models.file": microsoft_teams_api_models_file,
+        "microsoft_teams.api.models.file.file_consent_card": microsoft_teams_api_models_file_consent,
+        "microsoft_teams.api.models.file.file_info_card": microsoft_teams_api_models_file_info,
         "microsoft_teams.cards": microsoft_teams_cards,
         "microsoft_teams.apps.http": microsoft_teams_apps_http,
         "microsoft_teams.apps.http.adapter": microsoft_teams_apps_http_adapter,
@@ -400,6 +429,25 @@ class TestTeamsSend:
         result = await adapter.send("user:unknown", "Hello")
         assert result.success is False
         adapter._app.send.assert_not_called()
+
+    def test_concurrent_conversation_updates_do_not_lose_routes(self, tmp_path, monkeypatch):
+        store = tmp_path / "conversations.json"
+        users = [f"aad-{index}" for index in range(20)]
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(store))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", ",".join(users))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(
+                lambda user: _teams_mod._remember_conversation(
+                    user,
+                    f"19:{user}@thread.v2",
+                    "https://smba.trafficmanager.net/teams/",
+                ),
+                users,
+            ))
+        routes = json.loads(store.read_text())
+        assert set(routes) == set(users)
+        assert store.stat().st_mode & 0o777 == 0o600
+        assert Path(f"{store}.lock").stat().st_mode & 0o777 == 0o600
 
 
 def _make_summary_payload():
@@ -816,11 +864,225 @@ class TestTeamsMediaAttachments:
         adapter._app.send.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_send_document_local_file_base64(self, tmp_path):
+    async def test_send_document_uses_sender_bound_file_consent(self, tmp_path, monkeypatch):
+        route_store = tmp_path / "conversations.json"
+        route_store.write_text(json.dumps({
+            "aad-456": {
+                "chat_id": "19:abc@thread.v2",
+                "service_url": "https://smba.trafficmanager.net/teams/",
+            }
+        }))
+        upload_store = tmp_path / "pending-uploads.json"
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(route_store))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(upload_store))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STATUS_STORE", str(tmp_path / "status.json"))
         adapter = self._make_adapter()
         doc = tmp_path / "report.pdf"
         doc.write_bytes(b"%PDF-1.4 fake")
-        result = await adapter.send_document("19:abc@thread.v2", str(doc))
+        result = await adapter.send_document("user:aad-456", str(doc))
         assert result.success
+        assert result.raw_response["deliveryStatus"] == "file_consent_requested"
+        assert result.raw_response["terminal"] is False
         adapter._app.send.assert_awaited_once()
+        pending = json.loads(upload_store.read_text())
+        assert len(pending) == 1
+        entry = next(iter(pending.values()))
+        assert entry["user_id"] == "aad-456"
+        assert entry["chat_id"] == "19:abc@thread.v2"
+        assert entry["path"] == str(doc.resolve())
+        assert upload_store.stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.asyncio
+    async def test_send_document_refuses_unknown_conversation(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(tmp_path / "missing.json"))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(tmp_path / "pending.json"))
+        adapter = self._make_adapter()
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+        result = await adapter.send_document("19:unknown@thread.v2", str(doc))
+        assert not result.success
+        assert "captured personal conversation" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_document_refuses_file_outside_approved_roots(self, tmp_path, monkeypatch):
+        route_store = tmp_path / "conversations.json"
+        route_store.write_text(json.dumps({
+            "aad-456": {
+                "chat_id": "19:abc@thread.v2",
+                "service_url": "https://smba.trafficmanager.net/teams/",
+            }
+        }))
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(route_store))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_ROOTS", str(tmp_path / "approved"))
+        adapter = self._make_adapter()
+        document = tmp_path / "outside.pdf"
+        document.write_bytes(b"%PDF outside")
+        result = await adapter.send_document("user:aad-456", str(document))
+        assert not result.success
+        assert "roots" in result.error
+
+    def test_concurrent_upload_and_status_updates_do_not_lose_entries(self, tmp_path, monkeypatch):
+        upload_store = tmp_path / "pending.json"
+        status_store = tmp_path / "status.json"
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(upload_store))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STATUS_STORE", str(status_store))
+        documents = []
+        for index in range(20):
+            document = tmp_path / f"report-{index}.pdf"
+            document.write_bytes(f"%PDF {index}".encode())
+            documents.append(document)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            tokens = list(pool.map(
+                lambda document: _teams_mod._queue_file_upload(
+                    str(document), "aad-456", "19:abc@thread.v2", document.name
+                ),
+                documents,
+            ))
+        assert set(json.loads(upload_store.read_text())) == set(tokens)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(
+                lambda token: _teams_mod._record_file_upload_status(
+                    token, "file_consent_requested"
+                ),
+                tokens,
+            ))
+        assert set(json.loads(status_store.read_text())) == set(tokens)
+
+
+class _FakeUploadClient:
+    def __init__(self):
+        self.put = AsyncMock(return_value=SimpleNamespace(raise_for_status=lambda: None))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
+class TestTeamsFileConsentCallback:
+    @pytest.mark.asyncio
+    async def test_accept_uploads_exact_file_and_consumes_token(self, tmp_path, monkeypatch):
+        upload_store = tmp_path / "pending.json"
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(upload_store))
+        status_store = tmp_path / "status.json"
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STATUS_STORE", str(status_store))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-456")
+        document = tmp_path / "report.pdf"
+        document.write_bytes(b"%PDF test")
+        token = _teams_mod._queue_file_upload(
+            str(document), "aad-456", "19:abc@thread.v2", "report.pdf"
+        )
+
+        client = _FakeUploadClient()
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: client,
+        )
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        response = SimpleNamespace(
+            action="accept",
+            context={"token": token},
+            upload_info=SimpleNamespace(
+                upload_url="https://tenant.sharepoint.com/upload",
+                content_url="https://tenant.sharepoint.com/report.pdf",
+                unique_id="drive-item-1",
+                name="report.pdf",
+                file_type="pdf",
+            ),
+        )
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=response,
+                from_=SimpleNamespace(aad_object_id="aad-456", id="channel-id"),
+                conversation=SimpleNamespace(id="19:abc@thread.v2"),
+            ),
+            send=AsyncMock(),
+        )
+
+        result = await adapter._on_file_consent(ctx)
+        assert result.status == 200
+        client.put.assert_awaited_once()
+        assert client.put.await_args.kwargs["content"] == b"%PDF test"
+        assert client.put.await_args.kwargs["headers"] == {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": "9",
+            "Content-Range": "bytes 0-8/9",
+        }
+        assert json.loads(upload_store.read_text()) == {}
+        assert json.loads(status_store.read_text())[token]["status"] == "upload_complete"
+        ctx.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_accept_callback_uploads_only_once(self, tmp_path, monkeypatch):
+        upload_store = tmp_path / "pending.json"
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(upload_store))
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STATUS_STORE", str(tmp_path / "status.json"))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-456")
+        document = tmp_path / "report.pdf"
+        document.write_bytes(b"%PDF test")
+        token = _teams_mod._queue_file_upload(
+            str(document), "aad-456", "19:abc@thread.v2", "report.pdf"
+        )
+        client = _FakeUploadClient()
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: client,
+        )
+        response = SimpleNamespace(
+            action="accept",
+            context={"token": token},
+            upload_info=SimpleNamespace(
+                upload_url="https://tenant.sharepoint.com/upload",
+                content_url="https://tenant.sharepoint.com/report.pdf",
+                unique_id="drive-item-1",
+                name="report.pdf",
+                file_type="pdf",
+            ),
+        )
+        contexts = [
+            SimpleNamespace(
+                activity=SimpleNamespace(
+                    value=response,
+                    from_=SimpleNamespace(aad_object_id="aad-456", id="channel-id"),
+                    conversation=SimpleNamespace(id="19:abc@thread.v2"),
+                ),
+                send=AsyncMock(),
+            )
+            for _ in range(2)
+        ]
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+
+        results = await asyncio.gather(*(adapter._on_file_consent(ctx) for ctx in contexts))
+
+        assert [result.status for result in results] == [200, 200]
+        assert client.put.await_count == 1
+        assert json.loads(upload_store.read_text()) == {}
+        assert sum(ctx.send.await_count for ctx in contexts) == 2
+
+    @pytest.mark.asyncio
+    async def test_accept_rejects_token_from_different_sender(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEAMS_FILE_UPLOAD_STORE", str(tmp_path / "pending.json"))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-456,aad-evil")
+        document = tmp_path / "report.pdf"
+        document.write_bytes(b"%PDF test")
+        token = _teams_mod._queue_file_upload(
+            str(document), "aad-456", "19:abc@thread.v2", "report.pdf"
+        )
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action="accept", context={"token": token}),
+                from_=SimpleNamespace(aad_object_id="aad-evil", id="channel-id"),
+                conversation=SimpleNamespace(id="19:abc@thread.v2"),
+            ),
+            send=AsyncMock(),
+        )
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        result = await adapter._on_file_consent(ctx)
+        assert result.status == 200
+        ctx.send.assert_not_awaited()
+        assert token in json.loads((tmp_path / "pending.json").read_text())

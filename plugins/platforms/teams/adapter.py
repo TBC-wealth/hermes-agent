@@ -27,6 +27,8 @@ import html
 import json
 import logging
 import os
+import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -72,6 +74,7 @@ MessageActivity = None  # type: ignore[assignment,misc]
 ConversationReference = None  # type: ignore[assignment,misc]
 TypingActivityInput = None  # type: ignore[assignment,misc]
 AdaptiveCardInvokeActivity = None  # type: ignore[assignment,misc]
+FileConsentInvokeActivity = None  # type: ignore[assignment,misc]
 AdaptiveCardActionCardResponse = None  # type: ignore[assignment,misc]
 AdaptiveCardActionMessageResponse = None  # type: ignore[assignment,misc]
 AdaptiveCardInvokeResponse = None  # type: ignore[assignment,misc,union-attr]
@@ -83,6 +86,8 @@ HttpRouteHandler = None  # type: ignore[assignment,misc]
 AdaptiveCard = None  # type: ignore[assignment,misc]
 ExecuteAction = None  # type: ignore[assignment,misc]
 TextBlock = None  # type: ignore[assignment,misc]
+FileConsentCard = None  # type: ignore[assignment,misc]
+FileInfoCard = None  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -133,6 +138,10 @@ _MAX_BODY_BYTES = 1_048_576
 _DEFAULT_HOST = None
 _WEBHOOK_PATH = "/api/messages"
 _USER_TARGET_PREFIX = "user:"
+_MAX_FILE_UPLOAD_BYTES = 25 * 1024 * 1024
+_FILE_UPLOAD_TTL_SECONDS = 60 * 60
+_FILE_CONSENT_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.consent"
+_FILE_INFO_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.info"
 _STORE_LOCK_TIMEOUT_SECONDS = 10
 _STORE_THREAD_LOCK = threading.RLock()
 
@@ -264,6 +273,188 @@ def _resolve_user_target(chat_id: str) -> tuple[str, Optional[str]]:
     if not route:
         return "", None
     return route["chat_id"], route["service_url"]
+
+
+def _file_upload_store_path() -> Path:
+    configured = os.getenv("TEAMS_FILE_UPLOAD_STORE", "").strip()
+    if configured:
+        return Path(configured)
+    home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "teams" / "pending-uploads.json"
+
+
+def _file_upload_status_path() -> Path:
+    configured = os.getenv("TEAMS_FILE_UPLOAD_STATUS_STORE", "").strip()
+    if configured:
+        return Path(configured)
+    home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "teams" / "upload-status.json"
+
+
+def _allowed_file_upload_roots() -> tuple[Path, ...]:
+    """Return the explicit operator-owned roots eligible for document delivery."""
+    configured = os.getenv("TEAMS_FILE_UPLOAD_ROOTS", "")
+    roots = []
+    for value in configured.split(os.pathsep):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            root = Path(value).expanduser().resolve(strict=True)
+        except OSError:
+            continue
+        if root.is_dir() and not root.is_symlink():
+            roots.append(root)
+    return tuple(roots)
+
+
+def _validated_file_upload_path(path_value: str) -> Path:
+    roots = _allowed_file_upload_roots()
+    if not roots:
+        raise ValueError("Teams file upload roots are not configured")
+    path = Path(path_value).expanduser().resolve(strict=True)
+    if not any(path == root or path.is_relative_to(root) for root in roots):
+        raise ValueError("Teams file upload path is outside the approved roots")
+    return path
+
+
+def _load_file_uploads() -> Dict[str, Dict[str, Any]]:
+    path = _file_upload_store_path()
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("[teams] Pending upload store is unreadable; ignoring it")
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    now = time.time()
+    return {
+        str(token): item
+        for token, item in value.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("user_id"), str)
+        and isinstance(item.get("chat_id"), str)
+        and isinstance(item.get("expires_at"), (int, float))
+        and item["expires_at"] >= now
+    }
+
+
+def _write_file_uploads(uploads: Dict[str, Dict[str, Any]]) -> None:
+    path = _file_upload_store_path()
+    if path.is_symlink():
+        raise OSError("pending upload store is a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".pending-uploads-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(uploads, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _record_file_upload_status(token: str, status: str, **metadata: Any) -> None:
+    path = _file_upload_status_path()
+    if path.is_symlink():
+        raise OSError("upload status store is a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    with _locked_json_store(path):
+        try:
+            values = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            values = {}
+        if not isinstance(values, dict):
+            values = {}
+        cutoff = time.time() - (7 * 24 * 60 * 60)
+        values = {
+            key: item for key, item in values.items()
+            if isinstance(item, dict) and item.get("observed_at", 0) >= cutoff
+        }
+        values[token] = {"status": status, "observed_at": time.time(), **metadata}
+        descriptor, temporary = tempfile.mkstemp(prefix=".upload-status-", dir=path.parent)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(values, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+
+def _queue_file_upload(path_value: str, user_id: str, chat_id: str, file_name: str) -> str:
+    """Create a short-lived, sender-bound consent token for one regular file."""
+    path = _validated_file_upload_path(path_value)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError("Teams file upload requires a regular file")
+    if details.st_size > _MAX_FILE_UPLOAD_BYTES:
+        raise ValueError(f"Teams file upload exceeds {_MAX_FILE_UPLOAD_BYTES} bytes")
+    token = secrets.token_urlsafe(32)
+    store = _file_upload_store_path()
+    with _locked_json_store(store):
+        uploads = _load_file_uploads()
+        uploads[token] = {
+            "path": str(path),
+            "file_name": Path(file_name).name,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "size": details.st_size,
+            "device": details.st_dev,
+            "inode": details.st_ino,
+            "mtime_ns": details.st_mtime_ns,
+            "expires_at": time.time() + _FILE_UPLOAD_TTL_SECONDS,
+        }
+        _write_file_uploads(uploads)
+    return token
+
+
+def _claim_file_upload(token: str, user_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically consume a pending token bound to one sender/conversation."""
+    store = _file_upload_store_path()
+    with _locked_json_store(store):
+        uploads = _load_file_uploads()
+        pending = uploads.get(token)
+        if (
+            not pending
+            or pending.get("user_id") != user_id
+            or pending.get("chat_id") != chat_id
+        ):
+            return None
+        del uploads[token]
+        _write_file_uploads(uploads)
+        return pending
+
+
+def _user_for_chat(chat_id: str) -> str:
+    for user_id, route in _load_conversation_store().items():
+        if route.get("chat_id") == chat_id:
+            return user_id
+    return ""
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -840,6 +1031,9 @@ def check_teams_requirements() -> bool:
             from microsoft_teams.api.activities.invoke.adaptive_card import (
                 AdaptiveCardInvokeActivity,
             )
+            from microsoft_teams.api.activities.invoke.file_consent import (
+                FileConsentInvokeActivity,
+            )
             from microsoft_teams.api.models.adaptive_card import (
                 AdaptiveCardActionCardResponse,
                 AdaptiveCardActionMessageResponse,
@@ -855,6 +1049,8 @@ def check_teams_requirements() -> bool:
                 HttpRouteHandler,
             )
             from microsoft_teams.cards import AdaptiveCard, ExecuteAction, TextBlock
+            from microsoft_teams.api.models.file.file_consent_card import FileConsentCard
+            from microsoft_teams.api.models.file.file_info_card import FileInfoCard
 
         return {
             "web": _web,
@@ -866,6 +1062,7 @@ def check_teams_requirements() -> bool:
             "ConversationReference": ConversationReference,
             "TypingActivityInput": TypingActivityInput,
             "AdaptiveCardInvokeActivity": AdaptiveCardInvokeActivity,
+            "FileConsentInvokeActivity": FileConsentInvokeActivity,
             "AdaptiveCardActionCardResponse": AdaptiveCardActionCardResponse,
             "AdaptiveCardActionMessageResponse": AdaptiveCardActionMessageResponse,
             "InvokeResponse": InvokeResponse,
@@ -877,6 +1074,8 @@ def check_teams_requirements() -> bool:
             "AdaptiveCard": AdaptiveCard,
             "ExecuteAction": ExecuteAction,
             "TextBlock": TextBlock,
+            "FileConsentCard": FileConsentCard,
+            "FileInfoCard": FileInfoCard,
             "TEAMS_SDK_AVAILABLE": True,
         }
 
@@ -909,6 +1108,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        self._conv_types: Dict[str, str] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Lazy-install the Teams SDK on demand (parity with Slack/Discord/etc.),
@@ -965,6 +1165,12 @@ class TeamsAdapter(BasePlatformAdapter):
                 ctx: ActivityContext[AdaptiveCardInvokeActivity],
             ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
                 return await self._on_card_action(ctx)
+
+            @self._app.on_file_consent
+            async def _handle_file_consent(
+                ctx: ActivityContext[FileConsentInvokeActivity],
+            ) -> InvokeResponse[None]:
+                return await self._on_file_consent(ctx)
 
             # initialize() calls register_route() on the bridge, which adds
             # POST /api/messages to aiohttp_app automatically
@@ -1068,6 +1274,8 @@ class TeamsAdapter(BasePlatformAdapter):
             chat_type = "channel"
         else:
             chat_type = "dm"
+        if conv_id:
+            self._conv_types[str(conv_id)] = chat_type
 
         # Build source
         from_account = activity.from_
@@ -1190,6 +1398,114 @@ class TeamsAdapter(BasePlatformAdapter):
             message_id=msg_id,
         )
         await self.handle_message(event)
+
+    async def _on_file_consent(
+        self, ctx: "ActivityContext[FileConsentInvokeActivity]"
+    ) -> "InvokeResponse[None]":
+        """Upload exactly the file represented by a sender-bound consent token."""
+        response = ctx.activity.value
+        action_value = getattr(response, "action", "")
+        action = str(getattr(action_value, "value", action_value)).lower()
+        context = getattr(response, "context", None) or {}
+        token = context.get("token", "") if isinstance(context, dict) else ""
+        if not token:
+            logger.warning("[teams] File consent response omitted its opaque token")
+            return InvokeResponse(status=200)
+
+        pending = _load_file_uploads().get(token)
+        if not pending:
+            await ctx.send("This file request expired. Ask AgentSmith to send it again.")
+            return InvokeResponse(status=200)
+
+        sender = ctx.activity.from_
+        sender_id = str(getattr(sender, "aad_object_id", None) or getattr(sender, "id", ""))
+        conversation_id = str(getattr(ctx.activity.conversation, "id", "") or "")
+        allowed = {item.strip() for item in os.getenv("TEAMS_ALLOWED_USERS", "").split(",") if item.strip()}
+        if sender_id not in allowed or sender_id != pending["user_id"] or conversation_id != pending["chat_id"]:
+            logger.warning("[teams] Rejected file consent token used by a different sender/conversation")
+            return InvokeResponse(status=200)
+
+        if action == "decline":
+            pending = _claim_file_upload(token, sender_id, conversation_id)
+            if not pending:
+                await ctx.send("This file request expired. Ask AgentSmith to send it again.")
+                return InvokeResponse(status=200)
+            _record_file_upload_status(token, "declined", file_name=pending["file_name"])
+            await ctx.send("File upload declined.")
+            return InvokeResponse(status=200)
+        if action != "accept":
+            return InvokeResponse(status=200)
+
+        upload = getattr(response, "upload_info", None)
+        upload_url = str(getattr(upload, "upload_url", "") or "")
+        content_url = str(getattr(upload, "content_url", "") or "")
+        unique_id = str(getattr(upload, "unique_id", "") or "")
+        if not upload_url or not content_url or not unique_id:
+            await ctx.send("Teams did not provide a complete upload target. Ask AgentSmith to try again.")
+            return InvokeResponse(status=200)
+
+        # Consume the sender-bound token before the first network await. A
+        # duplicate Teams callback can now observe only an expired/in-flight
+        # token and cannot upload or emit a second file-info card.
+        pending = _claim_file_upload(token, sender_id, conversation_id)
+        if not pending:
+            await ctx.send("This file request expired. Ask AgentSmith to send it again.")
+            return InvokeResponse(status=200)
+
+        path = Path(pending["path"])
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            try:
+                details = os.fstat(descriptor)
+                identity = (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+                expected = (
+                    pending["device"], pending["inode"], pending["size"], pending["mtime_ns"]
+                )
+                if not stat.S_ISREG(details.st_mode) or identity != expected:
+                    raise ValueError("file changed after consent was requested")
+                with os.fdopen(os.dup(descriptor), "rb") as handle:
+                    data = handle.read(_MAX_FILE_UPLOAD_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            if len(data) != pending["size"]:
+                raise ValueError("file size changed after consent was requested")
+
+            from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+            if not is_safe_url(upload_url):
+                raise ValueError("Teams supplied an unsafe upload URL")
+            async with create_ssrf_safe_async_client(timeout=30, follow_redirects=False) as client:
+                result = await client.put(
+                    upload_url,
+                    content=data,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(len(data)),
+                        "Content-Range": f"bytes 0-{len(data) - 1}/{len(data)}",
+                    },
+                )
+                result.raise_for_status()
+
+            from microsoft_teams.api import Attachment, MessageActivityInput
+            info = Attachment(
+                content_type=_FILE_INFO_CONTENT_TYPE,
+                content_url=content_url,
+                name=str(getattr(upload, "name", None) or pending["file_name"]),
+                content=FileInfoCard(
+                    unique_id=unique_id,
+                    file_type=str(getattr(upload, "file_type", "") or ""),
+                ),
+            )
+            await ctx.send(MessageActivityInput().add_attachments(info))
+            _record_file_upload_status(
+                token, "upload_complete",
+                file_name=pending["file_name"], unique_id=unique_id,
+            )
+        except Exception as exc:
+            logger.error("[teams] File consent upload failed: %s", exc, exc_info=True)
+            _record_file_upload_status(token, "failed", file_name=pending["file_name"])
+            await ctx.send("The file upload failed. Ask AgentSmith to send it again.")
+        return InvokeResponse(status=200)
 
     async def _send_card(self, chat_id: str, card: "AdaptiveCard") -> "Any":
         """Send an AdaptiveCard, using a stored ConversationReference when available."""
@@ -1417,6 +1733,7 @@ class TeamsAdapter(BasePlatformAdapter):
         default_mime: str,
         caption: Optional[str] = None,
         media_label: str = "media",
+        file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file/URL as a Teams attachment.
 
@@ -1448,9 +1765,56 @@ class TeamsAdapter(BasePlatformAdapter):
                 content_url = source
                 mime_type = mimetypes.guess_type(source.split("?")[0])[0] or default_mime
             else:
-                # Local path — encode as base64 data URI
                 path = source.removeprefix("file://")
                 mime_type = mimetypes.guess_type(path)[0] or default_mime
+                if media_label == "document":
+                    user_id = (
+                        original_chat_id[len(_USER_TARGET_PREFIX):]
+                        if original_chat_id.startswith(_USER_TARGET_PREFIX)
+                        else _user_for_chat(chat_id)
+                    )
+                    if not user_id:
+                        return SendResult(
+                            success=False,
+                            error="Teams document delivery requires a captured personal conversation",
+                        )
+                    if self._conv_types.get(chat_id, "dm") != "dm":
+                        return SendResult(
+                            success=False,
+                            error="Teams FileConsent document delivery is supported only in personal chats",
+                        )
+                    consent_name = Path(file_name or path).name
+                    token = _queue_file_upload(path, user_id, chat_id, consent_name)
+                    consent = Attachment(
+                        content_type=_FILE_CONSENT_CONTENT_TYPE,
+                        name=consent_name,
+                        content=FileConsentCard(
+                            description=caption or "AgentSmith generated file",
+                            size_in_bytes=Path(path).stat().st_size,
+                            accept_context={"token": token},
+                            decline_context={"token": token},
+                        ),
+                    )
+                    activity = MessageActivityInput().add_attachments(consent)
+                    if caption:
+                        activity = activity.add_text(caption)
+                    conv_ref = self._conv_refs.get(original_chat_id) or self._conv_refs.get(chat_id)
+                    if conv_ref:
+                        result = await self._app.activity_sender.send(activity, conv_ref)
+                    else:
+                        result = await self._app.send(chat_id, activity)
+                    return SendResult(
+                        success=True,
+                        message_id=getattr(result, "id", None),
+                        raw_response={
+                            "deliveryStatus": "file_consent_requested",
+                            "terminal": False,
+                            "pendingUploadId": token,
+                        },
+                    )
+
+                # Local inline media — encode as a data URI. Generated documents
+                # use FileConsent above; this path is retained for small images/audio.
                 with open(path, "rb") as f:
                     content_url = f"data:{mime_type};base64,{base64.b64encode(f.read()).decode()}"
 
@@ -1551,6 +1915,7 @@ class TeamsAdapter(BasePlatformAdapter):
             default_mime="application/octet-stream",
             caption=caption,
             media_label="document",
+            file_name=file_name,
         )
 
     async def get_chat_info(self, chat_id: str) -> dict:
