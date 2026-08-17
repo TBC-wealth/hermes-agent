@@ -9290,6 +9290,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # elsewhere), which would otherwise trigger
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
+        # Skip home channel broadcast when there are no active sessions —
+        # only notify users who actually have running tasks.
+        if not active:
+            logger.info('No active sessions; skipping home channel shutdown broadcast')
+            return
         for platform, adapter in list(self.adapters.items()):
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
