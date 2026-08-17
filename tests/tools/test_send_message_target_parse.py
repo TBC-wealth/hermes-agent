@@ -29,6 +29,22 @@ def test_e164_target_still_requires_phone_platform() -> None:
     assert _parse_target_ref("matrix", "+15551234567")[2] is False
 
 
+def test_teams_aad_target_normalizes_to_captured_user_route() -> None:
+    aad = "6F5C43F5-C331-4518-B0DF-42862B0BF83A"
+
+    assert _parse_target_ref("teams", aad) == (
+        "user:6f5c43f5-c331-4518-b0df-42862b0bf83a",
+        None,
+        True,
+    )
+    assert _parse_target_ref("teams", f"user:{aad}") == (
+        "user:6f5c43f5-c331-4518-b0df-42862b0bf83a",
+        None,
+        True,
+    )
+    assert _parse_target_ref("teams", "some-channel") == (None, None, False)
+
+
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(

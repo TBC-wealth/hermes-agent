@@ -18,6 +18,10 @@ from agent.secret_scope import get_secret
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
+_TEAMS_AAD_USER_RE = re.compile(
+    r"^\s*([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\s*$",
+    re.IGNORECASE,
+)
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
 # Must be uppercase alphanumeric, 9+ chars. User IDs (U...) are parsed as
@@ -218,7 +222,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'teams:user:<AAD-object-id>' (captured personal Teams DM), 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -529,6 +533,21 @@ def _handle_send(args):
 
 def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
+    if platform_name == "teams":
+        # AgentSmith historically stored explicit teammate delivery as
+        # ``teams:<AAD-object-id>``. Teams proactive delivery requires the
+        # ``user:`` discriminator so the adapter resolves that stable identity
+        # through its allowlisted, captured personal-conversation store rather
+        # than mistaking the AAD ID for a conversation ID. Accept both spellings
+        # and normalize the legacy one at the shared send/cron parser boundary.
+        match = _TEAMS_AAD_USER_RE.fullmatch(target_ref)
+        if match:
+            return f"user:{match.group(1).lower()}", None, True
+        if target_ref.lower().startswith("user:"):
+            match = _TEAMS_AAD_USER_RE.fullmatch(target_ref[5:])
+            if match:
+                return f"user:{match.group(1).lower()}", None, True
+        return None, None, False
     if platform_name == "telegram":
         match = _TELEGRAM_TOPIC_TARGET_RE.fullmatch(target_ref)
         if match:
