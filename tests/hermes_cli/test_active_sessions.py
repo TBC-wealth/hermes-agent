@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import active_sessions
 
 
@@ -34,6 +35,67 @@ def test_resolve_max_concurrent_sessions_values(caplog):
         "Ignoring invalid max_concurrent_sessions='many'" in record.message
         for record in caplog.records
     )
+
+
+def test_lease_stays_bound_to_acquisition_registry_across_profile_context(tmp_path):
+    root_home = tmp_path / "root"
+    profile_home = tmp_path / "profiles" / "alberto"
+    root_token = set_hermes_home_override(root_home)
+    try:
+        lease, message = active_sessions.try_acquire_active_session(
+            session_id="root-session",
+            surface="teams",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert message is None
+        assert lease is not None
+        assert lease.state_path == root_home / "runtime" / "active_sessions.json"
+
+        profile_token = set_hermes_home_override(profile_home)
+        try:
+            assert active_sessions.transfer_active_session(
+                lease, session_id="routed-profile-session"
+            )
+            lease.release()
+        finally:
+            reset_hermes_home_override(profile_token)
+
+        assert active_sessions.active_session_registry_snapshot() == []
+        assert not (profile_home / "runtime" / "active_sessions.json").exists()
+        assert not (profile_home / "runtime" / "active_sessions.lock").exists()
+    finally:
+        reset_hermes_home_override(root_token)
+
+
+def test_failed_release_remains_retriable(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path / "root")
+    try:
+        lease, _ = active_sessions.try_acquire_active_session(
+            session_id="retry-release",
+            surface="teams",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert lease is not None
+        real_write = active_sessions._write_entries
+
+        def fail_write(_path, _entries):
+            raise OSError("simulated registry write failure")
+
+        monkeypatch.setattr(active_sessions, "_write_entries", fail_write)
+        try:
+            lease.release()
+        except OSError as exc:
+            assert "simulated registry write failure" in str(exc)
+        else:
+            raise AssertionError("release unexpectedly succeeded")
+        assert not lease.released
+
+        monkeypatch.setattr(active_sessions, "_write_entries", real_write)
+        lease.release()
+        assert lease.released
+        assert active_sessions.active_session_registry_snapshot() == []
+    finally:
+        reset_hermes_home_override(token)
 
 
 
