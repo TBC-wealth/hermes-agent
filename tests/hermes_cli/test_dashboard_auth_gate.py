@@ -59,6 +59,13 @@ def test_should_require_auth_truth_table(host, allow_public, expected):
     assert should_require_auth(host, allow_public) is expected
 
 
+def test_reverse_proxy_can_force_native_auth_on_loopback(monkeypatch):
+    from hermes_cli.web_server import should_require_auth
+
+    monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_AUTH", "1")
+    assert should_require_auth("127.0.0.1") is True
+
+
 # ---------------------------------------------------------------------------
 # start_server stashes auth_required on app.state (Task 0.3)
 # ---------------------------------------------------------------------------
@@ -201,5 +208,4 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
-
 

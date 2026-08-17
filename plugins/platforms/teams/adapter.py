@@ -1340,7 +1340,8 @@ class TeamsAdapter(BasePlatformAdapter):
 
         # Build source
         from_account = activity.from_
-        user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
+        literal_aad_object_id = getattr(from_account, "aad_object_id", None)
+        user_id = literal_aad_object_id or getattr(from_account, "id", "")
         user_name = getattr(from_account, "name", None) or ""
         # Proactive ``user:<AAD>`` delivery may carry private reminders and
         # documents. Never let a group/channel message replace the sender's
@@ -1361,6 +1362,21 @@ class TeamsAdapter(BasePlatformAdapter):
             user_name=user_name,
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
         )
+
+        # Dashboard authentication commands are control-plane messages, not
+        # prompts.  Handle them after Teams supplied an authenticated AAD /
+        # tenant identity but before attachments, transcript persistence, or
+        # LLM dispatch.  Exact command parsing keeps ordinary prose out of the
+        # auth state machine.
+        if await self._handle_ui_auth_command(
+            ctx,
+            text=text,
+            conversation_type=conv_type,
+            conversation_id=str(conv_id or ""),
+            aad_object_id=str(literal_aad_object_id or ""),
+            tenant_id=str(getattr(conv, "tenant_id", None) or ""),
+        ):
+            return
 
         # Handle attachments (images, documents, video, audio)
         media_urls = []
@@ -1459,6 +1475,96 @@ class TeamsAdapter(BasePlatformAdapter):
             message_id=msg_id,
         )
         await self.handle_message(event)
+
+    async def _handle_ui_auth_command(
+        self,
+        ctx: ActivityContext[MessageActivity],
+        *,
+        text: str,
+        conversation_type: str,
+        conversation_id: str,
+        aad_object_id: str,
+        tenant_id: str,
+    ) -> bool:
+        """Handle the closed set of Teams UI-auth commands pre-LLM."""
+        import os
+        import re
+
+        command = " ".join((text or "").strip().split())
+        folded = command.casefold()
+        confirm = re.fullmatch(
+            r"ui confirm ([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{13})",
+            command,
+            flags=re.IGNORECASE,
+        )
+        is_confirm_command = folded == "ui confirm" or folded.startswith("ui confirm ")
+        if folded not in {"ui login", "ui logout", "ui status"} and not is_confirm_command:
+            return False
+
+        if conversation_type != "personal":
+            await ctx.send("For security, use this UI command in your private chat with AgentSmith.")
+            return True
+        if is_confirm_command and confirm is None:
+            await ctx.send("That UI authentication request could not be completed.")
+            return True
+
+        try:
+            from agentsmith_ui_auth.client import AuthClientError
+            from hermes_cli.agentsmith_ui_auth_client import issuer_client, issuer_configured
+
+            if not aad_object_id or not tenant_id or not conversation_id:
+                await ctx.send("That UI authentication request could not be completed.")
+                return True
+            if not issuer_configured():
+                await ctx.send("The AgentSmith UI login service is not configured yet.")
+                return True
+            client = issuer_client()
+            if folded == "ui login":
+                public_url = os.environ.get("HERMES_DASHBOARD_PUBLIC_URL", "").strip().rstrip("/")
+                if not public_url:
+                    await ctx.send("The AgentSmith UI login service is not configured yet.")
+                    return True
+                grant = client.issue(
+                    aad_object_id=aad_object_id,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )["grant"]
+                await ctx.send(
+                    "Open this one-time link within 2 minutes:\n"
+                    f"{public_url}/auth/teams/login#grant={grant}\n\n"
+                    "The page will show a code. Send `UI confirm <code>` here to finish."
+                )
+            elif confirm is not None:
+                client.confirm(
+                    aad_object_id=aad_object_id,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    code=confirm.group(1).upper(),
+                )
+                await ctx.send("UI login confirmed. The browser will open AgentSmith now.")
+            elif folded == "ui logout":
+                result = client.logout_principal(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id
+                )
+                count = int(result["revoked_sessions"])
+                await ctx.send(
+                    f"Signed out {count} AgentSmith browser session"
+                    f"{'s' if count != 1 else ''}."
+                )
+            else:
+                status = client.status(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id
+                )
+                await ctx.send(
+                    "AgentSmith UI: active." if status["active"]
+                    else "AgentSmith UI: no active session."
+                )
+        except AuthClientError:
+            await ctx.send("That UI authentication request could not be completed.")
+        except Exception:
+            logger.exception("[teams] UI auth command failed")
+            await ctx.send("AgentSmith could not complete that UI authentication command.")
+        return True
 
     async def _on_file_consent(
         self, ctx: "ActivityContext[FileConsentInvokeActivity]"

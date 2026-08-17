@@ -1,0 +1,7 @@
+name: teams
+version: 1.0.0
+description: "Dashboard authentication confirmed through the same user's private Microsoft Teams chat."
+author: TBC
+kind: backend
+requires_env:
+  - AGENTSMITH_UI_AUTH_DASHBOARD_SOCKET
