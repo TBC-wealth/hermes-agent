@@ -144,6 +144,51 @@ _FILE_CONSENT_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.consent"
 _FILE_INFO_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.info"
 _STORE_LOCK_TIMEOUT_SECONDS = 10
 _STORE_THREAD_LOCK = threading.RLock()
+_APPROVAL_TTL_SECONDS = 10 * 60
+_PENDING_APPROVAL_LOCK = threading.RLock()
+_PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
+
+
+def _record_pending_approval(
+    token: str, *, session_key: str, user_id: str, profile: str,
+    chat_id: str, command: str, description: str,
+) -> None:
+    now = time.time()
+    with _PENDING_APPROVAL_LOCK:
+        for key, item in list(_PENDING_APPROVALS.items()):
+            if float(item.get("expires_at", 0)) <= now:
+                _PENDING_APPROVALS.pop(key, None)
+        _PENDING_APPROVALS[token] = {
+            "session_key": session_key,
+            "user_id": user_id,
+            "profile": profile,
+            "chat_id": chat_id,
+            "command": command,
+            "description": description,
+            "expires_at": now + _APPROVAL_TTL_SECONDS,
+        }
+
+
+def _claim_pending_approval(token: str, *, user_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically consume an approval bound to its initiating user and DM."""
+    now = time.time()
+    with _PENDING_APPROVAL_LOCK:
+        pending = _PENDING_APPROVALS.get(token)
+        if (
+            not pending
+            or float(pending.get("expires_at", 0)) <= now
+            or pending.get("user_id") != user_id
+            or pending.get("chat_id") != chat_id
+        ):
+            if pending and float(pending.get("expires_at", 0)) <= now:
+                _PENDING_APPROVALS.pop(token, None)
+            return None
+        return _PENDING_APPROVALS.pop(token)
+
+
+def _discard_pending_approval(token: str) -> None:
+    with _PENDING_APPROVAL_LOCK:
+        _PENDING_APPROVALS.pop(token, None)
 
 
 @contextmanager
@@ -1085,6 +1130,9 @@ def check_teams_requirements() -> bool:
 
 
 class TeamsAdapter(BasePlatformAdapter):
+    # Dangerous-command approvals are routed to the initiating user's DM and
+    # must never fall back to a group/channel text prompt.
+    private_exec_approval_only = True
     """Microsoft Teams adapter using the microsoft-teams-apps SDK."""
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
@@ -1528,9 +1576,9 @@ class TeamsAdapter(BasePlatformAdapter):
         action = ctx.activity.value.action
         data = action.data or {}
         hermes_action = data.get("hermes_action", "")
-        session_key = data.get("session_key", "")
+        approval_token = data.get("approval_token", "")
 
-        if not hermes_action or not session_key:
+        if not hermes_action or not approval_token:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
@@ -1544,6 +1592,13 @@ class TeamsAdapter(BasePlatformAdapter):
         allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
         allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
 
+        from_account = ctx.activity.from_
+        clicker_id = str(
+            getattr(from_account, "aad_object_id", None)
+            or getattr(from_account, "id", "")
+        )
+        conversation_id = str(getattr(ctx.activity.conversation, "id", "") or "")
+
         if not allow_all:
             if not allowed_csv:
                 logger.warning(
@@ -1556,8 +1611,6 @@ class TeamsAdapter(BasePlatformAdapter):
                         value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
                     ),
                 )
-            from_account = ctx.activity.from_
-            clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
             if "*" not in allowed_ids and clicker_id not in allowed_ids:
                 logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
@@ -1579,6 +1632,21 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
+        pending = _claim_pending_approval(
+            str(approval_token), user_id=clicker_id, chat_id=conversation_id,
+        )
+        if pending is None:
+            logger.warning("[teams] Rejected approval token used by a different sender/conversation")
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
+                ),
+            )
+
+        session_key = str(pending["session_key"])
         if not has_blocking_approval(session_key):
             return InvokeResponse(
                 status=200,
@@ -1597,8 +1665,8 @@ class TeamsAdapter(BasePlatformAdapter):
             "always": "✅ Always allowed",
             "deny": "❌ Denied",
         }
-        cmd = data.get("cmd", "")
-        desc = data.get("desc", "")
+        cmd = str(pending.get("command", ""))
+        desc = str(pending.get("description", ""))
         body = []
         if cmd:
             body.append(TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"))
@@ -1629,12 +1697,33 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        metadata = metadata or {}
+        requester_id = str(metadata.get("requester_user_id") or "")
+        requester_profile = str(metadata.get("requester_profile") or "")
+        allowed_ids = {
+            item.strip() for item in os.getenv("TEAMS_ALLOWED_USERS", "").split(",")
+            if item.strip()
+        }
+        resolved_chat_id, _ = _resolve_user_target(f"{_USER_TARGET_PREFIX}{requester_id}")
+        if requester_id not in allowed_ids or not requester_profile or not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="Teams command approval requires the requester's captured personal chat",
+            )
+
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        # Truncated for button data payload — just enough to reconstruct the card body.
+        approval_token = secrets.token_urlsafe(32)
+        _record_pending_approval(
+            approval_token,
+            session_key=session_key,
+            user_id=requester_id,
+            profile=requester_profile,
+            chat_id=resolved_chat_id,
+            command=command,
+            description=description,
+        )
         btn_data_base = {
-            "session_key": session_key,
-            "cmd": command[:200] + "..." if len(command) > 200 else command,
-            "desc": description,
+            "approval_token": approval_token,
         }
 
         actions = [ExecuteAction(
@@ -1667,10 +1756,11 @@ class TeamsAdapter(BasePlatformAdapter):
         card = AdaptiveCard().with_version("1.4").with_body(body).with_actions(actions)
 
         try:
-            result = await self._send_card(chat_id, card)
+            result = await self._send_card(resolved_chat_id, card)
             message_id = getattr(result, "id", None) if result else None
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
+            _discard_pending_approval(approval_token)
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 

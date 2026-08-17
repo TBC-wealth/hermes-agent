@@ -1299,11 +1299,20 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
+    prefix = ""
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if is_multiplex_active():
+            from hermes_cli.profiles import get_active_profile_name
+            prefix = f"profile:{get_active_profile_name() or 'default'}:"
+    except Exception:
+        # Existing single-profile behavior is the safe compatibility fallback.
+        prefix = ""
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
         if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
-    return "default"
+            return prefix + task_id
+    return prefix + "default"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
