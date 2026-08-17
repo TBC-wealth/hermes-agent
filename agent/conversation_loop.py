@@ -1026,6 +1026,12 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
+    current_revision = (os.getenv("AGENTSMITH_PROMPT_REVISION") or "").strip()
+    if current_revision:
+        stored_revision = line_value("AgentSmith prompt revision")
+        if stored_revision != current_revision:
+            return False
+
     return True
 
 
