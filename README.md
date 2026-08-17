@@ -2,6 +2,12 @@
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
+> [!NOTE]
+> This is TBC Wealth's maintained Hermes fork. TBC development happens on
+> `main`; production deployments use immutable, tested `*-tbc.*` release tags.
+> See [TBC fork maintenance](docs/tbc-fork-maintenance.md) before syncing
+> upstream or cutting a release.
+
 # Hermes Agent ☤
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
