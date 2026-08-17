@@ -32,6 +32,7 @@ except ImportError:
 _cached_tz: Optional[ZoneInfo] = None
 _cached_tz_name: Optional[str] = None
 _cache_resolved: bool = False
+_cached_timezones: dict[str, tuple[str, Optional[ZoneInfo]]] = {}
 
 
 def _resolve_timezone_name() -> str:
@@ -93,17 +94,35 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
         return None
 
 
+def _cache_scope() -> str:
+    """Return the configuration identity that owns the cached timezone.
+
+    A multiplex gateway serves many profile homes concurrently. A single
+    process-global value lets a long-running cron worker observe whichever
+    profile the ticker touched most recently. Key the cache by the effective
+    config path (or the explicit process-wide environment override) instead.
+    """
+    tz_env = os.getenv("HERMES_TIMEZONE", "").strip()
+    return f"env:{tz_env}" if tz_env else f"config:{get_config_path().resolve()}"
+
+
 def get_timezone() -> Optional[ZoneInfo]:
     """Return the user's configured ZoneInfo, or None (meaning server-local).
 
     Resolved once and cached. Call ``reset_cache()`` after config changes.
     """
     global _cached_tz, _cached_tz_name, _cache_resolved
-    if not _cache_resolved:
-        _cached_tz_name = _resolve_timezone_name()
-        _cached_tz = _get_zoneinfo(_cached_tz_name)
-        _cache_resolved = True
-    return _cached_tz
+    scope = _cache_scope()
+    cached = _cached_timezones.get(scope)
+    if cached is None:
+        name = _resolve_timezone_name()
+        cached = (name, _get_zoneinfo(name))
+        _cached_timezones[scope] = cached
+    # Retain the original observability fields for compatible diagnostics;
+    # the keyed mapping above is the authority.
+    _cached_tz_name, _cached_tz = cached
+    _cache_resolved = True
+    return cached[1]
 
 
 def reset_cache() -> None:
@@ -117,6 +136,7 @@ def reset_cache() -> None:
     _cached_tz = None
     _cached_tz_name = None
     _cache_resolved = False
+    _cached_timezones.clear()
 
 
 def now() -> datetime:

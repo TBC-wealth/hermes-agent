@@ -21,10 +21,8 @@ import hermes_time
 
 
 def _reset_hermes_time_cache():
-    """Reset the hermes_time module cache (replacement for removed reset_cache)."""
-    hermes_time._cached_tz = None
-    hermes_time._cached_tz_name = None
-    hermes_time._cache_resolved = False
+    """Reset every profile-scoped hermes_time cache entry."""
+    hermes_time.reset_cache()
 
 
 # =========================================================================
@@ -85,6 +83,40 @@ class TestGetTimezone:
         tz = hermes_time.get_timezone()
         assert isinstance(tz, ZoneInfo)
         assert str(tz) == "Europe/London"
+
+    def test_multiplex_profiles_keep_separate_cached_timezones(self, tmp_path, monkeypatch):
+        """Interleaved profile contexts must never share one cached timezone."""
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        homes = {
+            "vancouver": tmp_path / "vancouver",
+            "kolkata": tmp_path / "kolkata",
+        }
+        for home in homes.values():
+            home.mkdir()
+        expected = {
+            str((homes["vancouver"] / "config.yaml").resolve()): "America/Vancouver",
+            str((homes["kolkata"] / "config.yaml").resolve()): "Asia/Kolkata",
+        }
+        monkeypatch.setattr(
+            hermes_time,
+            "_resolve_timezone_name",
+            lambda: expected[str(hermes_time.get_config_path().resolve())],
+        )
+
+        def resolve(home):
+            token = set_hermes_home_override(home)
+            try:
+                return str(hermes_time.get_timezone())
+            finally:
+                reset_hermes_home_override(token)
+
+        assert resolve(homes["vancouver"]) == "America/Vancouver"
+        assert resolve(homes["kolkata"]) == "Asia/Kolkata"
+        assert resolve(homes["vancouver"]) == "America/Vancouver"
 
 
 
