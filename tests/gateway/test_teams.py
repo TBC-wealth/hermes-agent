@@ -642,6 +642,104 @@ class TestTeamsMessageHandling:
         assert "user:aad-456" not in adapter._conv_refs
 
 
+class TestTeamsUIAuthCommands:
+    def _adapter_and_context(self, text, *, conversation_type="personal"):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant-789",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+        activity = MagicMock()
+        activity.text = text
+        activity.id = f"activity-{text}"
+        activity.from_ = MagicMock(id="user", aad_object_id="aad-456", name="Alberto")
+        activity.conversation = MagicMock(
+            id="19:personal", conversation_type=conversation_type,
+            name="Chat", tenant_id="tenant-789",
+        )
+        activity.attachments = []
+        ctx = MagicMock(activity=activity)
+        ctx.send = AsyncMock()
+        return adapter, ctx
+
+    @pytest.mark.anyio
+    async def test_ui_login_and_confirm_bypass_llm(self, monkeypatch):
+        client = MagicMock()
+        client.issue.return_value = {"grant": "grant-secret"}
+        client.confirm.return_value = {"confirmed": True}
+        monkeypatch.setattr(
+            "hermes_cli.agentsmith_ui_auth_client.issuer_configured", lambda: True,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.agentsmith_ui_auth_client.issuer_client", lambda: client,
+        )
+        monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://agentsmith.example")
+        adapter, login_ctx = self._adapter_and_context("  UI   login ")
+        await adapter._on_message(login_ctx)
+        adapter.handle_message.assert_not_awaited()
+        login_reply = login_ctx.send.await_args.args[0]
+        assert "https://agentsmith.example/auth/teams/login#grant=grant-secret" in login_reply
+
+        code = "23456789ABCDE"
+        adapter2, confirm_ctx = self._adapter_and_context(f"UI confirm {code}")
+        await adapter2._on_message(confirm_ctx)
+        adapter2.handle_message.assert_not_awaited()
+        assert "confirmed" in confirm_ctx.send.await_args.args[0].lower()
+        client.issue.assert_called_once_with(
+            aad_object_id="aad-456", tenant_id="tenant-789",
+            conversation_id="19:personal",
+        )
+        client.confirm.assert_called_once_with(
+            aad_object_id="aad-456", tenant_id="tenant-789",
+            conversation_id="19:personal", code=code,
+        )
+
+    @pytest.mark.anyio
+    async def test_ui_command_in_group_fails_closed(self, monkeypatch):
+        adapter, ctx = self._adapter_and_context("UI login", conversation_type="groupChat")
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_not_awaited()
+        assert "private chat" in ctx.send.await_args.args[0]
+
+    @pytest.mark.anyio
+    async def test_similar_prose_is_not_treated_as_command(self, monkeypatch):
+        adapter, ctx = self._adapter_and_context("Can you explain UI login please?")
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_awaited_once()
+        ctx.send.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_malformed_confirmation_is_intercepted_before_llm(self):
+        adapter, ctx = self._adapter_and_context("UI confirm 123456")
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_not_awaited()
+        assert "could not be completed" in ctx.send.await_args.args[0]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("missing", ["aad", "tenant"])
+    async def test_ui_auth_never_falls_back_to_generic_sender_or_configured_tenant(
+        self, monkeypatch, missing,
+    ):
+        client = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.agentsmith_ui_auth_client.issuer_configured", lambda: True,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.agentsmith_ui_auth_client.issuer_client", lambda: client,
+        )
+        adapter, ctx = self._adapter_and_context("UI login")
+        if missing == "aad":
+            ctx.activity.from_.aad_object_id = None
+            ctx.activity.from_.id = "generic-sender-must-not-work"
+        else:
+            ctx.activity.conversation.tenant_id = None
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_not_awaited()
+        assert "could not be completed" in ctx.send.await_args.args[0]
+        client.issue.assert_not_called()
+
+
 class TestTeamsAttachmentClassification:
     """Document attachments must set MessageType.DOCUMENT so run.py's
     document-context injection surfaces the cached file to the agent

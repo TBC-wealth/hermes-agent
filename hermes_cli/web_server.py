@@ -488,6 +488,14 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
     config/MCP/agent surface open to internet scanners.
     """
+    # A reverse proxy commonly terminates TLS in front of a loopback-bound
+    # dashboard.  In that deployment loopback describes only the proxy hop,
+    # not the trust boundary, so operators must be able to force the native
+    # cookie gate on without exposing uvicorn directly.
+    if os.environ.get("HERMES_DASHBOARD_REQUIRE_AUTH", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
     return host not in _LOOPBACK_HOST_VALUES
 
 
