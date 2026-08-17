@@ -2521,13 +2521,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+        if task_name.startswith("pa-briefing-"):
+            # PA briefings are ordinary user-facing messages, not operator
+            # diagnostics. Keep their stable internal job name/id out of the
+            # conversation while retaining the legacy wrapper for other jobs.
+            username = task_name.removeprefix("pa-briefing-").replace("-", " ").title()
+            delivery_content = f"PA briefing {username}\n\n{content}"
+        else:
+            delivery_content = (
+                f"Cronjob Response: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{content}\n\n"
+                f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            )
     else:
         delivery_content = content
 
