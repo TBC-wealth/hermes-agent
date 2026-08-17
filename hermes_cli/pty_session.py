@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
+from typing import Any, Optional
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
@@ -41,8 +41,12 @@ class RingBuffer:
 
 
 class PtySession:
-    def __init__(self, key: str, bridge, *, buffer_cap: int, read_timeout: float) -> None:
+    def __init__(
+        self, key: str, bridge, *, owner: Any = None,
+        buffer_cap: int, read_timeout: float,
+    ) -> None:
         self.key = key
+        self.owner = owner
         self.bridge = bridge
         self.buffer = RingBuffer(buffer_cap)
         self.alive = True
@@ -136,6 +140,10 @@ class RegistryFull(Exception):
     pass
 
 
+class OwnerMismatch(Exception):
+    """A keep-alive token was presented by a different browser session."""
+
+
 async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 60.0) -> None:
     """Periodically reap idle/dead keep-alive sessions. Cancelled on shutdown."""
     while True:
@@ -155,11 +163,13 @@ class PtySessionRegistry:
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
 
-    async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
+    async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object], owner: Any = None
                               ) -> Tuple[PtySession, bool]:
         await self.reap_idle()
         existing = self._sessions.get(key)
         if existing is not None and existing.alive:
+            if existing.owner != owner:
+                raise OwnerMismatch()
             return existing, False
         if existing is not None:                       # dead remnant
             await existing.close()
@@ -169,7 +179,7 @@ class PtySessionRegistry:
         # PTY spawn does blocking fork/exec work — keep it off the event
         # loop (#53227).
         bridge = await asyncio.to_thread(spawn)
-        session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
+        session = PtySession(key, bridge, owner=owner, buffer_cap=self._buffer_cap,
                              read_timeout=self._read_timeout)
         await session.start()
         self._sessions[key] = session
@@ -202,4 +212,13 @@ class PtySessionRegistry:
 
     async def close_all(self) -> None:
         for key in list(self._sessions):
+            await self._sessions.pop(key).close()
+
+    async def close_matching(self, predicate) -> None:
+        """Close complete PTY process trees whose live owner matches."""
+        doomed = [
+            key for key, session in self._sessions.items()
+            if session.owner is None or predicate(session.owner)
+        ]
+        for key in doomed:
             await self._sessions.pop(key).close()

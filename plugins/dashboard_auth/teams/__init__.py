@@ -30,7 +30,7 @@ class TeamsDashboardAuthProvider(DashboardAuthProvider):
         raise NotImplementedError("Teams login completes through /auth/teams/collect")
 
     @staticmethod
-    def _session(value: dict) -> Session:
+    def _session(value: dict, *, access_token: str = "") -> Session:
         return Session(
             user_id=value["aad_object_id"],
             email="",
@@ -38,13 +38,17 @@ class TeamsDashboardAuthProvider(DashboardAuthProvider):
             org_id=value["tenant_id"],
             provider="teams",
             expires_at=int(value["expires_at"]),
-            access_token=value.get("access_token", ""),
+            access_token=value.get("access_token", access_token),
             refresh_token="",
+            session_key=value["session_key"],
         )
 
     def verify_session(self, *, access_token: str) -> Session | None:
         try:
-            return self._session(self.client.verify(access_token=access_token))
+            return self._session(
+                self.client.verify(access_token=access_token),
+                access_token=access_token,
+            )
         except AuthClientError as exc:
             if exc.code == "invalid_session":
                 return None

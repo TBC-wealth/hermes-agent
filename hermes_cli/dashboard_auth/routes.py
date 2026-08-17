@@ -1106,7 +1106,21 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    import hashlib
+
+    access_token = str(sess.access_token or "")
+    session_key = str(getattr(sess, "session_key", "") or "")
+    if not session_key and access_token:
+        session_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    if not access_token or not session_key:
+        raise HTTPException(status_code=503, detail="Session cannot mint WebSocket tickets")
+    ticket = mint_ticket(
+        user_id=sess.user_id,
+        provider=sess.provider,
+        session_key=session_key,
+        org_id=sess.org_id,
+        access_token=access_token,
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

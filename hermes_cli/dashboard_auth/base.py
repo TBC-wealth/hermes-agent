@@ -23,6 +23,10 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    # Stable opaque ownership key used only for live WebSocket/PTY revocation.
+    # Providers without one keep the default; the live-authority seam derives
+    # an in-memory SHA-256 key from their access token instead.
+    session_key: str = ""
 
 
 @dataclass(frozen=True)
