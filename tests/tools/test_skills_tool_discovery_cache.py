@@ -9,6 +9,7 @@ hermes_cli/profiles.py::_count_skills) plus the disabled-set, with a short
 TTL bounding in-place SKILL.md edit staleness.
 """
 
+import json
 import time
 
 import pytest
@@ -66,3 +67,37 @@ def test_disabled_and_full_views_cached_separately(tmp_path, monkeypatch):
     everything = sorted(s["name"] for s in st._find_all_skills(skip_disabled=True))
     assert filtered == ["skill-one"]
     assert everything == ["skill-one", "skill-two"]
+
+
+def test_dot_disabled_skill_directories_are_not_discovered(tmp_path):
+    _write_skill(tmp_path, "cat-a", "active-skill")
+    _write_skill(tmp_path, "cat-a", "archived-skill.disabled")
+
+    discovered = st._find_all_skills(skip_disabled=True)
+
+    assert [skill["name"] for skill in discovered] == ["active-skill"]
+
+
+def test_dot_disabled_skill_does_not_collide_with_active_external_skill(
+    tmp_path, monkeypatch
+):
+    archived = _write_skill(tmp_path, "cat-a", "shared.disabled")
+    (archived / "SKILL.md").write_text(
+        "---\nname: shared\ndescription: archived\n---\n# archived\n",
+        encoding="utf-8",
+    )
+    external_root = tmp_path / "external"
+    active = external_root / "shared"
+    active.mkdir(parents=True)
+    (active / "SKILL.md").write_text(
+        "---\nname: shared\ndescription: active\n---\n# active\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent.skill_utils.get_external_skills_dirs", lambda: [external_root]
+    )
+
+    viewed = json.loads(st.skill_view("shared"))
+
+    assert viewed["success"] is True
+    assert viewed["description"] == "active"
