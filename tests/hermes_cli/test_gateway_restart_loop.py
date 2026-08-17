@@ -695,6 +695,20 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_remote_binary_script_read_does_not_crash_guard(self):
+        """A sandbox fallback may decode a binary returned by ``cat``."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/wrapper.sh",
+            cwd="/remote",
+            read_remote_script=lambda _path: "\x7fELF\x00binary payload",
+        )
+
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
