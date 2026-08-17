@@ -749,6 +749,39 @@ class TestTeamsUIAuthCommands:
         assert "could not be completed" in ctx.send.await_args.args[0]
         client.issue.assert_not_called()
 
+    @pytest.mark.anyio
+    async def test_internal_login_and_confirm_use_separate_authority_and_bypass_llm(
+        self, monkeypatch,
+    ):
+        client = MagicMock()
+        client.issue.return_value = {"grant": "internal-grant"}
+        monkeypatch.setattr(
+            "hermes_cli.agentsmith_ui_auth_client.internal_issuer_configured", lambda: True,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.agentsmith_ui_auth_client.internal_issuer_client", lambda: client,
+        )
+        monkeypatch.setenv("AGENTSMITH_INTERNAL_PUBLIC_URL", "https://internal.example")
+        adapter, login_ctx = self._adapter_and_context("Internal login")
+        await adapter._on_message(login_ctx)
+        adapter.handle_message.assert_not_awaited()
+        assert "https://internal.example/auth/teams/login#grant=internal-grant" in login_ctx.send.await_args.args[0]
+        code = "23456789ABCDE"
+        adapter2, confirm_ctx = self._adapter_and_context(f"Internal confirm {code}")
+        await adapter2._on_message(confirm_ctx)
+        adapter2.handle_message.assert_not_awaited()
+        client.confirm.assert_called_once_with(
+            aad_object_id="aad-456", tenant_id="tenant-789",
+            conversation_id="19:personal", code=code,
+        )
+
+    @pytest.mark.anyio
+    async def test_similar_internal_login_prose_reaches_llm(self):
+        adapter, ctx = self._adapter_and_context("Can you explain Internal login?")
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_awaited_once()
+        ctx.send.assert_not_awaited()
+
 
 class TestTeamsAttachmentClassification:
     """Document attachments must set MessageType.DOCUMENT so run.py's

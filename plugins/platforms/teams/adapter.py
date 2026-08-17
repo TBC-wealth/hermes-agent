@@ -1377,6 +1377,15 @@ class TeamsAdapter(BasePlatformAdapter):
             tenant_id=str(getattr(conv, "tenant_id", None) or ""),
         ):
             return
+        if await self._handle_internal_auth_command(
+            ctx,
+            text=text,
+            conversation_type=conv_type,
+            conversation_id=str(conv_id or ""),
+            aad_object_id=str(literal_aad_object_id or ""),
+            tenant_id=str(getattr(conv, "tenant_id", None) or ""),
+        ):
+            return
 
         # Handle attachments (images, documents, video, audio)
         media_urls = []
@@ -1564,6 +1573,80 @@ class TeamsAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("[teams] UI auth command failed")
             await ctx.send("AgentSmith could not complete that UI authentication command.")
+        return True
+
+    async def _handle_internal_auth_command(
+        self, ctx: ActivityContext[MessageActivity], *, text: str,
+        conversation_type: str, conversation_id: str,
+        aad_object_id: str, tenant_id: str,
+    ) -> bool:
+        """Handle the isolated internal-site auth command set before LLM dispatch."""
+        import os
+        import re
+        command = " ".join((text or "").strip().split())
+        folded = command.casefold()
+        confirm = re.fullmatch(
+            r"internal confirm ([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{13})",
+            command, flags=re.IGNORECASE,
+        )
+        is_confirm = folded == "internal confirm" or folded.startswith("internal confirm ")
+        if folded not in {"internal login", "internal logout", "internal status"} and not is_confirm:
+            return False
+        if conversation_type != "personal":
+            await ctx.send("For security, use this Internal command in your private chat with AgentSmith.")
+            return True
+        if is_confirm and confirm is None:
+            await ctx.send("That Internal authentication request could not be completed.")
+            return True
+        try:
+            from agentsmith_ui_auth.client import AuthClientError
+            from hermes_cli.agentsmith_ui_auth_client import (
+                internal_issuer_client, internal_issuer_configured,
+            )
+            if not aad_object_id or not tenant_id or not conversation_id:
+                await ctx.send("That Internal authentication request could not be completed.")
+                return True
+            if not internal_issuer_configured():
+                await ctx.send("The TBC Internal login service is not configured yet.")
+                return True
+            client = internal_issuer_client()
+            if folded == "internal login":
+                public_url = os.environ.get("AGENTSMITH_INTERNAL_PUBLIC_URL", "").strip().rstrip("/")
+                if not public_url:
+                    await ctx.send("The TBC Internal login service is not configured yet.")
+                    return True
+                grant = client.issue(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )["grant"]
+                await ctx.send(
+                    "Open this one-time link within 2 minutes:\n"
+                    f"{public_url}/auth/teams/login#grant={grant}\n\n"
+                    "The page will show a code. Send `Internal confirm <code>` here to finish."
+                )
+            elif confirm is not None:
+                client.confirm(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id,
+                    conversation_id=conversation_id, code=confirm.group(1).upper(),
+                )
+                await ctx.send("Internal login confirmed. The browser will open TBC Internal now.")
+            elif folded == "internal logout":
+                result = client.logout_principal(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id,
+                )
+                count = int(result["revoked_sessions"])
+                await ctx.send(f"Signed out {count} TBC Internal browser session{'s' if count != 1 else ''}.")
+            else:
+                status = client.status(aad_object_id=aad_object_id, tenant_id=tenant_id)
+                await ctx.send(
+                    "TBC Internal: active." if status["active"]
+                    else "TBC Internal: no active session."
+                )
+        except AuthClientError:
+            await ctx.send("That Internal authentication request could not be completed.")
+        except Exception:
+            logger.exception("[teams] Internal auth command failed")
+            await ctx.send("AgentSmith could not complete that Internal authentication command.")
         return True
 
     async def _on_file_consent(

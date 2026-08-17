@@ -11,6 +11,7 @@ from agentsmith_ui_auth.client import AuthClient
 _lock = threading.Lock()
 _issuer: AuthClient | None = None
 _dashboard: AuthClient | None = None
+_internal_issuer: AuthClient | None = None
 
 
 def _configured(name: str) -> bool:
@@ -24,6 +25,10 @@ def issuer_configured() -> bool:
 
 def dashboard_configured() -> bool:
     return _configured("AGENTSMITH_UI_AUTH_DASHBOARD_SOCKET")
+
+
+def internal_issuer_configured() -> bool:
+    return _configured("AGENTSMITH_INTERNAL_AUTH_ISSUER_SOCKET")
 
 
 def issuer_client() -> AuthClient:
@@ -46,3 +51,14 @@ def dashboard_client() -> AuthClient:
         if _dashboard is None:
             _dashboard = AuthClient(Path(path))
         return _dashboard
+
+
+def internal_issuer_client() -> AuthClient:
+    global _internal_issuer
+    path = os.environ.get("AGENTSMITH_INTERNAL_AUTH_ISSUER_SOCKET", "").strip()
+    if not path:
+        raise RuntimeError("internal auth issuer capability is not configured")
+    with _lock:
+        if _internal_issuer is None:
+            _internal_issuer = AuthClient(Path(path))
+        return _internal_issuer
