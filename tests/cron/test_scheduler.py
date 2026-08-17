@@ -1594,6 +1594,7 @@ class TestBuildJobPromptSilentHint:
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
         assert "Check for updates" in result
+        assert "never claim that a messaging tool is unavailable" in result
 
 
 class TestParseWakeGate:
