@@ -54,6 +54,12 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     api_invoke_card.AdaptiveCardInvokeActivity = type(
         "AdaptiveCardInvokeActivity", (), {}
     )
+    api_invoke_file_consent = types.ModuleType(
+        "microsoft_teams.api.activities.invoke.file_consent"
+    )
+    api_invoke_file_consent.FileConsentInvokeActivity = type(
+        "FileConsentInvokeActivity", (), {}
+    )
 
     api_models = types.ModuleType("microsoft_teams.api.models")
     api_models.__path__ = []  # type: ignore[attr-defined]
@@ -71,6 +77,16 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     api_models_invoke.AdaptiveCardInvokeResponse = type(
         "AdaptiveCardInvokeResponse", (), {}
     )
+    api_models_file = types.ModuleType("microsoft_teams.api.models.file")
+    api_models_file.__path__ = []  # type: ignore[attr-defined]
+    api_models_file_consent = types.ModuleType(
+        "microsoft_teams.api.models.file.file_consent_card"
+    )
+    api_models_file_consent.FileConsentCard = type("FileConsentCard", (), {})
+    api_models_file_info = types.ModuleType(
+        "microsoft_teams.api.models.file.file_info_card"
+    )
+    api_models_file_info.FileInfoCard = type("FileInfoCard", (), {})
 
     apps_http = types.ModuleType("microsoft_teams.apps.http")
     apps_http.__path__ = []  # type: ignore[attr-defined]
@@ -96,9 +112,13 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
         "microsoft_teams.api.activities.typing": api_typing,
         "microsoft_teams.api.activities.invoke": api_invoke,
         "microsoft_teams.api.activities.invoke.adaptive_card": api_invoke_card,
+        "microsoft_teams.api.activities.invoke.file_consent": api_invoke_file_consent,
         "microsoft_teams.api.models": api_models,
         "microsoft_teams.api.models.adaptive_card": api_models_card,
         "microsoft_teams.api.models.invoke_response": api_models_invoke,
+        "microsoft_teams.api.models.file": api_models_file,
+        "microsoft_teams.api.models.file.file_consent_card": api_models_file_consent,
+        "microsoft_teams.api.models.file.file_info_card": api_models_file_info,
         "microsoft_teams.apps.http": apps_http,
         "microsoft_teams.apps.http.adapter": apps_http_adapter,
         "microsoft_teams.cards": cards,
