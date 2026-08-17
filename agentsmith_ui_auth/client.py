@@ -118,3 +118,12 @@ class AuthClient:
 
     def logout_session(self, **params):
         return self.call("logout_session", **params)
+
+    def revocations(self, **params):
+        return self.call("revocations", **params)
+
+    def acknowledge(self, **params):
+        return self.call("acknowledge", **params)
+
+    def health(self, **params):
+        return self.call("health", **params)

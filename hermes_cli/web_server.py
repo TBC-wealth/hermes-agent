@@ -224,6 +224,20 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    app.state.live_authority_required = False
+
+    # Synchronize the durable revocation stream before any gated browser
+    # WebSocket can be accepted.  Failure is fail-closed for live authority
+    # while the background subscriber retries.
+    from hermes_cli.agentsmith_ui_auth_client import (
+        dashboard_client as _ui_auth_dashboard_client,
+        dashboard_configured as _ui_auth_dashboard_configured,
+    )
+    from hermes_cli.dashboard_auth.live_authority import LIVE_AUTHORITY
+    if getattr(app.state, "auth_required", False) and _ui_auth_dashboard_configured():
+        app.state.live_authority_required = True
+        LIVE_AUTHORITY.configure(_ui_auth_dashboard_client(), PTY_REGISTRY)
+        await LIVE_AUTHORITY.start()
 
     # Import hermes_cli.gateway eagerly *before* the lifespan yield so the
     # GIL-heavy .pyc compilation and Defender scan cost is absorbed during
@@ -265,6 +279,7 @@ async def _lifespan(app: "FastAPI"):
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
+        await LIVE_AUTHORITY.stop()
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
@@ -376,6 +391,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# HTTP middleware is not invoked for WebSocket upgrades.  A pure ASGI gate
+# therefore owns every gated browser WebSocket before any route handler can
+# accept it, including WebSockets supplied by bundled plugins.
+from hermes_cli.dashboard_auth.live_authority import WebSocketAuthorityMiddleware
+app.add_middleware(WebSocketAuthorityMiddleware)
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -14411,7 +14432,9 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
+from hermes_cli.pty_session import (  # noqa: E402
+    OwnerMismatch, PtySessionRegistry, RegistryFull, run_reaper,
+)
 
 PTY_REGISTRY = PtySessionRegistry(
     ttl=30 * 60,
@@ -14683,6 +14706,15 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
+        # The outer ASGI authority middleware already consumed and
+        # revalidated gated credentials.  Preserve this helper as the shared
+        # route seam without consuming a one-time ticket twice.
+        authority = (
+            (getattr(ws, "scope", {}) or {}).get("state") or {}
+        ).get("ws_authority") or {}
+        credential = authority.get("credential")
+        if credential in {"ticket", "internal"}:
+            return None, str(credential)
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
@@ -15752,13 +15784,21 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
+    from hermes_cli.dashboard_auth.live_authority import websocket_owner
+    live_owner = websocket_owner(ws)
     try:
         session, _created = await PTY_REGISTRY.attach_or_spawn(
-            attach_token, spawn=_spawn
+            attach_token, spawn=_spawn, owner=live_owner
         )
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
+        return
+    except OwnerMismatch:
+        await ws.send_text(
+            "\r\n\x1b[31mChat reattach denied for this browser session.\x1b[0m\r\n"
+        )
+        await ws.close(code=4403)
         return
     except (FileNotFoundError, OSError, RegistryFull) as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
