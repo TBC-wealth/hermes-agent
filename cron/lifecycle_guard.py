@@ -565,6 +565,12 @@ def _contains_unsafe_gateway_action(
 ) -> bool:
     if _direct_lifecycle_scan(command):
         return True
+    # A remote/sandbox script read can return decoded binary bytes containing
+    # NUL even though the bounded local reader already filters binaries. Do
+    # not feed that payload back through shlex/pathlib: Path() and resolve()
+    # can raise ``ValueError: embedded null byte`` before the guarded file read.
+    if "\x00" in command:
+        return False
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
