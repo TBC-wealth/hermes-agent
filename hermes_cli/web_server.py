@@ -1825,6 +1825,8 @@ _SENSITIVE_MANAGED_DIR_NAMES = frozenset({
     "pairing",
 })
 
+_OPERATOR_FILE_DIRS = ("Uploads", "Documents", "Archive")
+
 
 def _is_sensitive_filename(name: str) -> bool:
     """Return True for a basename the managed-files API must never expose.
@@ -1867,6 +1869,14 @@ def _is_sensitive_path(path: Path) -> bool:
     if _is_sensitive_filename(path.name):
         return True
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
+
+
+def _is_hidden_managed_path(path: Path) -> bool:
+    return any(part.startswith(".") and part not in {".", ".."} for part in path.parts)
+
+
+def _managed_read_is_denied(path: Path) -> bool:
+    return _is_sensitive_path(path) or _is_hidden_managed_path(path)
 
 
 _FS_DATA_URL_MAX_BYTES = 16 * 1024 * 1024
@@ -2186,6 +2196,9 @@ def _managed_files_policy(request: Request, *, create_root: bool = True) -> Mana
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
         root = _ensure_managed_root(raw_forced_root) if create_root else _canonical_path(Path(raw_forced_root))
+        if create_root:
+            for name in _OPERATOR_FILE_DIRS:
+                _ensure_managed_root(root / name)
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
     # Remote/OAuth access does not imply a hosted container. Users can expose a
@@ -2387,7 +2400,7 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         entries = [
             _managed_file_entry(policy, child)
             for child in target.iterdir()
-            if not _is_sensitive_path(child)
+            if not _managed_read_is_denied(child)
         ]
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
@@ -2414,8 +2427,8 @@ async def read_managed_file(request: Request, path: str):
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Path is not a file")
-    if _is_sensitive_path(target):
-        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    if _managed_read_is_denied(target):
+        raise HTTPException(status_code=403, detail="Access to hidden or sensitive files is not allowed")
 
     try:
         size = target.stat().st_size
@@ -2458,8 +2471,8 @@ async def download_managed_file(request: Request, path: str):
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Path is not a file")
-    if _is_sensitive_path(target):
-        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    if _managed_read_is_denied(target):
+        raise HTTPException(status_code=403, detail="Access to hidden or sensitive files is not allowed")
 
     try:
         size = target.stat().st_size
