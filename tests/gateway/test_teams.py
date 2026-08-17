@@ -229,6 +229,28 @@ def _make_config(**extra):
 # Tests: Requirements
 # ---------------------------------------------------------------------------
 
+class TestTeamsAiohttpBridge:
+    @pytest.mark.asyncio
+    async def test_malformed_json_returns_400_without_calling_sdk(self):
+        app = MagicMock()
+        registered = {}
+        app.router.add_route.side_effect = (
+            lambda method, path, handler: registered.update(handler=handler)
+        )
+        sdk_handler = AsyncMock()
+        bridge = _teams_mod._AiohttpBridgeAdapter(app)
+        bridge.register_route("POST", "/api/messages", sdk_handler)
+
+        request = MagicMock()
+        request.json = AsyncMock(
+            side_effect=json.JSONDecodeError("invalid", "", 0),
+        )
+        response = await registered["handler"](request)
+
+        assert response.status == 400
+        sdk_handler.assert_not_awaited()
+
+
 class TestTeamsRequirements:
 
 

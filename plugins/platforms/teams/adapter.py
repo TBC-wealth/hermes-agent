@@ -763,7 +763,10 @@ class _AiohttpBridgeAdapter:
         """Register an SDK route handler as an aiohttp route."""
 
         async def _aiohttp_handler(request: "web.Request") -> "web.Response":
-            body = await request.json()
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, ValueError):
+                return web.Response(status=400)
             headers = dict(request.headers)
             result: "HttpResponse" = await handler(HttpRequest(body=body, headers=headers))
             status = result.get("status", 200)
