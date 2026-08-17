@@ -375,6 +375,32 @@ class TestTeamsSend:
         assert result.message_id == "msg-123"
         mock_app.send.assert_awaited_once_with("conv-id", "Hello")
 
+    @pytest.mark.anyio
+    async def test_send_resolves_stable_aad_target(self, tmp_path, monkeypatch):
+        store = tmp_path / "conversations.json"
+        store.write_text(json.dumps({
+            "aad-456": {
+                "chat_id": "19:abc@thread.v2",
+                "service_url": "https://smba.trafficmanager.net/teams/",
+            }
+        }))
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(store))
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        adapter._app.send = AsyncMock(return_value=SimpleNamespace(id="msg-1"))
+        result = await adapter.send("user:aad-456", "Hello")
+        assert result.success is True
+        adapter._app.send.assert_awaited_once_with("19:abc@thread.v2", "Hello")
+
+    @pytest.mark.anyio
+    async def test_send_fails_closed_for_unknown_aad_target(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(tmp_path / "missing.json"))
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        result = await adapter.send("user:unknown", "Hello")
+        assert result.success is False
+        adapter._app.send.assert_not_called()
+
 
 def _make_summary_payload():
     return TeamsMeetingSummaryPayload(
@@ -484,6 +510,66 @@ class TestTeamsMessageHandling:
 
         event = adapter.handle_message.call_args[0][0]
         assert event.source.chat_type == "group"
+
+    @pytest.mark.anyio
+    async def test_allowed_sender_route_is_persisted_atomically(self, tmp_path, monkeypatch):
+        store = tmp_path / "private" / "conversations.json"
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(store))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-456")
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+        activity = self._make_activity()
+        activity.service_url = "https://smba.trafficmanager.net/teams/"
+        await adapter._on_message(self._make_ctx(activity))
+        route = json.loads(store.read_text())["aad-456"]
+        assert route["chat_id"] == "19:abc@thread.v2"
+        assert route["service_url"] == "https://smba.trafficmanager.net/teams/"
+        assert store.stat().st_mode & 0o777 == 0o600
+        assert "user:aad-456" in adapter._conv_refs
+
+    @pytest.mark.anyio
+    async def test_unlisted_sender_route_is_not_persisted(self, tmp_path, monkeypatch):
+        store = tmp_path / "conversations.json"
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(store))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "someone-else")
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+        activity = self._make_activity()
+        activity.service_url = "https://smba.trafficmanager.net/teams/"
+        await adapter._on_message(self._make_ctx(activity))
+        assert not store.exists()
+
+    @pytest.mark.anyio
+    async def test_group_message_does_not_replace_personal_route(self, tmp_path, monkeypatch):
+        store = tmp_path / "conversations.json"
+        store.write_text(json.dumps({
+            "aad-456": {
+                "chat_id": "19:personal@thread.v2",
+                "service_url": "https://smba.trafficmanager.net/teams/",
+            }
+        }))
+        monkeypatch.setenv("TEAMS_CONVERSATION_STORE", str(store))
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-456")
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+        activity = self._make_activity(
+            conversation_id="19:group@thread.v2",
+            conversation_type="groupChat",
+        )
+        activity.service_url = "https://smba.trafficmanager.net/teams/"
+
+        await adapter._on_message(self._make_ctx(activity))
+
+        assert json.loads(store.read_text())["aad-456"]["chat_id"] == "19:personal@thread.v2"
+        assert "user:aad-456" not in adapter._conv_refs
 
 
 class TestTeamsAttachmentClassification:
@@ -737,5 +823,4 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
-
 

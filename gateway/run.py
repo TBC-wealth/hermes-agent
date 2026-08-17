@@ -23934,6 +23934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                user_id=getattr(source, "user_id", None),
             )
         except Exception:
             logger.warning(

@@ -4,10 +4,11 @@ Allows a single Hermes instance to route specific Discord guilds/channels/thread
 to different profiles — each with their own model, tools, memory, and persona.
 
 Matching priority (most specific first):
-  1. platform + chat_id + thread_id (exact thread)  — specificity 14
-  2. platform + chat_id (channel route)             — specificity 6
-  3. platform + guild_id (guild/server route)       — specificity 2
-  4. No match                                       → default profile
+  1. platform + user_id (verified sender route)     — specificity 16
+  2. platform + chat_id + thread_id (exact thread)  — specificity 14
+  3. platform + chat_id (channel route)             — specificity 6
+  4. platform + guild_id (guild/server route)       — specificity 2
+  5. No match                                       → default profile
 
 Parent-chain matching:
 For Discord threads and forum posts, ``parent_chat_id`` carries the
@@ -57,6 +58,7 @@ class ProfileRoute:
     guild_id: Optional[str] = None
     chat_id: Optional[str] = None
     thread_id: Optional[str] = None
+    user_id: Optional[str] = None
     enabled: bool = True
 
     @property
@@ -69,6 +71,8 @@ class ProfileRoute:
             s += 4
         if self.thread_id:
             s += 8
+        if self.user_id:
+            s += 16
         return s
 
     def matches(
@@ -78,6 +82,7 @@ class ProfileRoute:
         chat_id: Optional[str] = None,
         thread_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> bool:
         """Return True if this route matches the given source fields.
 
@@ -92,6 +97,8 @@ class ProfileRoute:
         if not self.enabled:
             return False
         if self.platform != platform:
+            return False
+        if self.user_id and self.user_id != user_id:
             return False
         if self.thread_id and self.thread_id != thread_id:
             return False
@@ -142,6 +149,7 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 guild_id=entry.get("guild_id"),
                 chat_id=entry.get("chat_id"),
                 thread_id=entry.get("thread_id"),
+                user_id=entry.get("user_id"),
                 enabled=entry.get("enabled", True),
             )
         )
@@ -158,9 +166,10 @@ def match_profile_route(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     parent_chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Optional[ProfileRoute]:
     """Return the best-matching route, or None for no match."""
     for route in routes:
-        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
+        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id, user_id=user_id):
             return route
     return None
