@@ -67,3 +67,21 @@ def test_env_type_override_keeps_own_id():
         )
     finally:
         terminal_tool.clear_task_env_overrides("bench-env")
+
+
+def test_multiplexed_profiles_never_share_the_default_container(monkeypatch):
+    from agent import secret_scope
+    import hermes_cli.profiles as profiles
+
+    current = {"name": "alberto"}
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: current["name"])
+    secret_scope.set_multiplex_active(True)
+    try:
+        first = terminal_tool._resolve_container_task_id(None)
+        current["name"] = "jenny"
+        second = terminal_tool._resolve_container_task_id(None)
+    finally:
+        secret_scope.set_multiplex_active(False)
+    assert first == "profile:alberto:default"
+    assert second == "profile:jenny:default"
+    assert first != second

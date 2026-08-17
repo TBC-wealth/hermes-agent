@@ -1096,3 +1096,31 @@ class TestTeamsFileConsentCallback:
         assert result.status == 200
         ctx.send.assert_not_awaited()
         assert token in json.loads((tmp_path / "pending.json").read_text())
+
+
+class TestTeamsApprovalBinding:
+    def test_approval_is_sender_dm_bound_and_one_shot(self):
+        token = "approval-token"
+        _teams_mod._record_pending_approval(
+            token,
+            session_key="agent:main:teams:dm:chat-a:user-a",
+            user_id="user-a",
+            profile="alberto",
+            chat_id="chat-a",
+            command="rm fixture",
+            description="fixture",
+        )
+        assert _teams_mod._claim_pending_approval(
+            token, user_id="user-b", chat_id="chat-a"
+        ) is None
+        assert _teams_mod._claim_pending_approval(
+            token, user_id="user-a", chat_id="chat-b"
+        ) is None
+        claimed = _teams_mod._claim_pending_approval(
+            token, user_id="user-a", chat_id="chat-a"
+        )
+        assert claimed is not None
+        assert claimed["profile"] == "alberto"
+        assert _teams_mod._claim_pending_approval(
+            token, user_id="user-a", chat_id="chat-a"
+        ) is None

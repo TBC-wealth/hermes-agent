@@ -5881,13 +5881,20 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_metadata = dict(ctx._status_thread_metadata or {})
+                    _approval_metadata.update({
+                        "requester_user_id": str(ctx.source.user_id or ""),
+                        "requester_profile": str(getattr(ctx.source, "profile", "") or ""),
+                        "requester_chat_id": str(ctx.source.chat_id or ""),
+                        "requester_chat_type": str(getattr(ctx.source, "chat_type", "") or ""),
+                    })
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -5905,10 +5912,14 @@ class TurnRunner:
                         "Button-based approval failed (send returned error), falling back to text: %s",
                         _approval_result.error,
                     )
+                    if getattr(type(ctx._status_adapter), "private_exec_approval_only", False):
+                        return
                 except Exception as _e:
                     logger.warning(
                         "Button-based approval failed, falling back to text: %s", _e
                     )
+                    if getattr(type(ctx._status_adapter), "private_exec_approval_only", False):
+                        return
 
             # Fallback: plain text approval prompt.  Use the adapter's
             # typed prefix so Slack/Matrix users are told the form they
