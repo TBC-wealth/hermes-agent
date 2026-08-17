@@ -326,6 +326,11 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
+# Profile home captured at dispatch for each in-flight job. The multiplex
+# ticker enters a profile-local cron store only on its own thread; shutdown
+# runs on the gateway thread, so job IDs alone are not enough to update the
+# correct jobs.json when an in-flight run is interrupted.
+_running_job_homes: dict = {}
 _running_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
@@ -383,11 +388,33 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     """
     with _running_lock:
         job_ids = list(_running_job_ids)
+        job_homes = {
+            job_id: _running_job_homes.get(job_id)
+            for job_id in job_ids
+        }
         _interrupted_job_ids.update(job_ids)
     marked = []
     for job_id in job_ids:
         try:
-            mark_job_run(job_id, False, reason)
+            home = job_homes.get(job_id)
+            if home is None:
+                mark_job_run(job_id, False, reason)
+            else:
+                from cron.jobs import use_cron_store
+                from hermes_constants import (
+                    reset_hermes_home_override,
+                    set_hermes_home_override,
+                )
+                from hermes_time import reset_cache as reset_timezone_cache
+
+                home_token = set_hermes_home_override(str(home))
+                reset_timezone_cache()
+                try:
+                    with use_cron_store(home):
+                        mark_job_run(job_id, False, reason)
+                finally:
+                    reset_hermes_home_override(home_token)
+                    reset_timezone_cache()
             marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
@@ -4265,6 +4292,7 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+                _running_job_homes[job_id] = get_hermes_home().resolve()
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
@@ -4277,12 +4305,14 @@ def tick(
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                        _running_job_homes.pop(j["id"], None)
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
+                    _running_job_homes.pop(job_id, None)
                 finish_execution(
                     execution["id"],
                     success=False,

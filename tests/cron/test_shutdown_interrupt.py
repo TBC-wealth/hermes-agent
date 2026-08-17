@@ -23,9 +23,11 @@ def _reset_scheduler_state():
     import cron.scheduler as sched
 
     sched._running_job_ids.clear()
+    sched._running_job_homes.clear()
     sched._interrupted_job_ids.clear()
     yield
     sched._running_job_ids.clear()
+    sched._running_job_homes.clear()
     sched._interrupted_job_ids.clear()
 
 
@@ -84,6 +86,28 @@ class TestMarkRunningJobsInterrupted:
             # success must be False -- an interrupted run is never "ok".
             assert c.args[1] is False
             assert "gateway shutdown" in c.args[2]
+
+    def test_marks_job_in_its_dispatched_profile_store(self, tmp_path):
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+
+        profile_home = tmp_path / "profiles" / "kyle"
+        sched._running_job_ids.add("job-1")
+        sched._running_job_homes["job-1"] = profile_home
+        observed = []
+
+        def capture(job_id, success, reason):
+            observed.append(
+                (job_id, success, jobs._current_cron_store().jobs_file)
+            )
+
+        with patch("cron.scheduler.mark_job_run", side_effect=capture):
+            marked = sched.mark_running_jobs_interrupted("shutdown")
+
+        assert marked == ["job-1"]
+        assert observed == [
+            ("job-1", False, profile_home / "cron" / "jobs.json")
+        ]
 
     def test_sets_interrupted_flag_for_consumption_by_run_one_job(self):
         import cron.scheduler as sched
