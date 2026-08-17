@@ -24,6 +24,7 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -35,7 +36,7 @@ def _captured_context_cwd(agent):
 
     def fake_context_files(
         cwd=None, skip_soul=False, context_length=None,
-        allow_install_tree_fallback=False,
+        allow_install_tree_fallback=False, home_override=None,
     ):
         captured["cwd"] = cwd
         return ""
@@ -62,6 +63,21 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
+class TestAgentSmithPromptRevision:
+    def test_reviewed_revision_is_last_runtime_identity_line(self, monkeypatch):
+        revision = "b" * 64
+        monkeypatch.setenv("AGENTSMITH_PROMPT_REVISION", revision)
+        parts = _prompt_parts(_make_agent())
+        assert parts["volatile"].endswith(
+            f"AgentSmith prompt revision: {revision}"
+        )
+
+    def test_invalid_revision_is_not_injected(self, monkeypatch):
+        monkeypatch.setenv("AGENTSMITH_PROMPT_REVISION", "../../unreviewed")
+        parts = _prompt_parts(_make_agent())
+        assert "AgentSmith prompt revision:" not in parts["volatile"]
+
+
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
@@ -80,6 +96,30 @@ def _prompt_parts(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)
+
+
+def test_profile_prompt_sources_receive_agent_home(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    profile_home = root / "profiles" / "alberto"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    agent = _make_agent(
+        valid_tool_names=["skill_view"],
+        _session_db=SimpleNamespace(db_path=profile_home / "state.db"),
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value="") as soul,
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.get_toolset_for_tool", return_value=None),
+        patch("run_agent.build_skills_system_prompt", return_value="") as skills,
+        patch("run_agent.build_context_files_prompt", return_value="") as context,
+    ):
+        build_system_prompt_parts(agent)
+
+    soul.assert_called_once_with(None, home_override=profile_home)
+    assert skills.call_args.kwargs["skills_dir_override"] == profile_home / "skills"
+    assert context.call_args.kwargs["home_override"] == profile_home
 
 
 def _init_code_repo(path):

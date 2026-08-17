@@ -159,6 +159,11 @@ def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
+def _is_archived_skill_path(path: Path) -> bool:
+    """Return whether a skill lives in an explicitly disabled archive tree."""
+    return any(part.endswith(".disabled") for part in path.parts)
+
+
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -720,7 +725,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+            if (
+                any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts)
+                or _is_archived_skill_path(skill_md)
+            ):
                 continue
 
             skill_dir = skill_md.parent
@@ -1111,6 +1119,8 @@ def skill_view(
         seen_md: set = set()
 
         def _record(sd: Optional[Path], smd: Path) -> None:
+            if _is_archived_skill_path(smd):
+                return
             try:
                 key = smd.resolve()
             except Exception:

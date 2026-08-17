@@ -32,6 +32,7 @@ import inspect
 import json
 import logging
 import os
+import stat
 import queue
 import re
 import shlex
@@ -1850,6 +1851,46 @@ def _profile_runtime_scope(profile_home: "Path"):
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
+
+
+def _claim_agentsmith_profile_welcome(profile_home: "Path") -> bool:
+    """Atomically claim the one-time welcome for a routed profile.
+
+    A profile-local flag is required because the multiplexed gateway's session
+    store is process-global. Returning False on any state error fails closed
+    against sending the welcome repeatedly.
+    """
+    welcome_flag = Path(profile_home) / "state" / "agentsmith-welcome-v1.json"
+    try:
+        welcome_flag.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory = welcome_flag.parent.lstat()
+        if (
+            welcome_flag.parent.is_symlink()
+            or not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != os.geteuid()
+        ):
+            raise OSError("profile first-contact directory is unsafe")
+        os.chmod(welcome_flag.parent, 0o700)
+        descriptor = os.open(
+            welcome_flag,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"format": 1, "claimed": True}, handle)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return True
+    except FileExistsError:
+        return False
+    except OSError as error:
+        logger.warning(
+            "Could not persist profile first-contact state for %s: %s",
+            Path(profile_home).name or "default",
+            error,
+        )
+        return False
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -5061,13 +5102,20 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_metadata = dict(ctx._status_thread_metadata or {})
+                    _approval_metadata.update({
+                        "requester_user_id": str(ctx.source.user_id or ""),
+                        "requester_profile": str(getattr(ctx.source, "profile", "") or ""),
+                        "requester_chat_id": str(ctx.source.chat_id or ""),
+                        "requester_chat_type": str(getattr(ctx.source, "chat_type", "") or ""),
+                    })
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -5085,10 +5133,14 @@ class TurnRunner:
                         "Button-based approval failed (send returned error), falling back to text: %s",
                         _approval_result.error,
                     )
+                    if getattr(type(ctx._status_adapter), "private_exec_approval_only", False):
+                        return
                 except Exception as _e:
                     logger.warning(
                         "Button-based approval failed, falling back to text: %s", _e
                     )
+                    if getattr(type(ctx._status_adapter), "private_exec_approval_only", False):
+                        return
 
             # Fallback: plain text approval prompt.  Use the adapter's
             # typed prefix so Slack/Matrix users are told the form they
@@ -9279,6 +9331,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # elsewhere), which would otherwise trigger
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
+        # Skip home channel broadcast when there are no active sessions —
+        # only notify users who actually have running tasks.
+        if not active:
+            logger.info('No active sessions; skipping home channel shutdown broadcast')
+            return
         for platform, adapter in list(self.adapters.items()):
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
@@ -17181,11 +17238,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
-        # First-message onboarding -- only on the very first interaction ever.
+        # First-message onboarding. A multiplexed gateway must track this per
+        # routed profile: the process-global session store becomes non-empty
+        # after the first employee writes, which otherwise suppresses welcome
+        # guidance for every later employee.
         # Delivered on the current user message (sidecar), NOT the ephemeral
         # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
         # system-prompt diff and agent rebuild.
-        if not history and not await self.async_session_store.has_any_sessions():
+        _multiplex_first_contact = False
+        if not history and getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            _profile_home = self._resolve_profile_home_for_source(source)
+            _multiplex_first_contact = await asyncio.to_thread(
+                _claim_agentsmith_profile_welcome, _profile_home
+            )
+
+        if _multiplex_first_contact:
+            turn_sidecar_notes.append(
+                "[System note: This is the verified employee's first AgentSmith message. "
+                "Start with a concise welcome, then answer their request. Explain that Microsoft "
+                "365 actions use only their requester-bound account and approved skills; other "
+                "employees' connectors are inaccessible. Mention the essential live commands: "
+                "/help (current catalog), /new (fresh session), /stop (stop current work), "
+                "/cron (scheduled jobs), and /sethome (delivery chat). For access or provisioning "
+                "issues, point them to Alberto, Michele, or Kyle. Never reveal internal IDs. "
+                "Keep the welcome to at most eight short lines.]"
+            )
+        elif not history and not await self.async_session_store.has_any_sessions():
             # Default first-contact note: a brief self-introduction.
             _intro_note = (
                 "[System note: This is the user's very first message ever. "
@@ -23934,6 +24012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                user_id=getattr(source, "user_id", None),
             )
         except Exception:
             logger.warning(

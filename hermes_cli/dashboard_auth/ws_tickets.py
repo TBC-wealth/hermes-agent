@@ -59,7 +59,10 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(
+    *, user_id: str, provider: str, session_key: str = "",
+    org_id: str = "", access_token: str = "",
+) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
@@ -70,6 +73,11 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
     info = {
         "user_id": user_id,
         "provider": provider,
+        "session_key": session_key,
+        "org_id": org_id,
+        # This stays only in the process-local, 30-second ticket store.  It is
+        # needed to revalidate the browser session immediately before accept.
+        "access_token": access_token,
         "minted_at": int(time.time()),
     }
     with _lock:

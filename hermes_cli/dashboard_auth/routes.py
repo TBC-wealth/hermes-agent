@@ -145,6 +145,151 @@ async def login_page(request: Request) -> HTMLResponse:
 
 
 # ---------------------------------------------------------------------------
+# Public: Teams-confirmed login
+# ---------------------------------------------------------------------------
+
+_TEAMS_LOGIN_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentSmith sign in</title>
+<style>
+body{margin:0;background:#0b1020;color:#edf2ff;font:16px system-ui,sans-serif}
+main{max-width:520px;margin:12vh auto;padding:32px;background:#151d33;border:1px solid #33405f;border-radius:14px}
+h1{margin-top:0}code{font-size:1.7rem;letter-spacing:.1em;color:#9bc3ff}p{line-height:1.5}.bad{color:#ffadad}
+</style></head><body><main><h1>Confirm in Microsoft Teams</h1>
+<p id="message">Opening your one-time login link…</p><p><code id="code"></code></p>
+<p id="instruction"></p></main><script nonce="__NONCE__">
+const message=document.getElementById('message'), code=document.getElementById('code'), instruction=document.getElementById('instruction');
+const grant=new URLSearchParams(location.hash.slice(1)).get('grant')||'';
+history.replaceState(null,'','/auth/teams/login');
+function fail(text){message.textContent=text;message.className='bad';code.textContent='';instruction.textContent='Send UI login to AgentSmith in a private Teams chat and try again.'}
+async function begin(){
+ if(!grant){fail('This login link is missing or expired.');return}
+ let response=await fetch('/auth/teams/redeem',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({grant})});
+ let body=await response.json();if(!response.ok){fail('This login link is invalid or expired.');return}
+ code.textContent=body.code;message.textContent='In the same private Teams chat, send:';instruction.textContent='UI confirm '+body.code;
+ const deadline=Date.now()+(body.expires_in*1000);
+ while(Date.now()<deadline){await new Promise(r=>setTimeout(r,1000));response=await fetch('/auth/teams/pending',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:'{}'});if(response.status===202)continue;let result=await response.json();if(response.ok&&result.ok){message.textContent='Confirmed. Opening AgentSmith…';code.textContent='';instruction.textContent='';location.replace(result.next||'/');return}fail('This login attempt expired.');return}
+ fail('This login attempt expired.');
+} begin().catch(()=>fail('AgentSmith could not complete sign in.'));
+</script></body></html>"""
+
+_PENDING_COOKIE = "__Host-agentsmith_pending"
+_PENDING_MAX_AGE = 120
+
+
+class _TeamsRedeemBody(BaseModel):
+    grant: str
+
+
+class _TeamsPendingBody(BaseModel):
+    next: str = ""
+
+
+def _teams_provider():
+    provider = get_provider("teams")
+    if provider is None or not hasattr(provider, "client"):
+        raise HTTPException(status_code=503, detail="Teams sign-in is not configured")
+    return provider
+
+
+@router.get("/auth/teams/login", name="auth_teams_login_page")
+async def auth_teams_login_page() -> HTMLResponse:
+    import secrets
+    nonce = secrets.token_urlsafe(18)
+    return HTMLResponse(
+        _TEAMS_LOGIN_HTML.replace("__NONCE__", nonce),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Content-Security-Policy": f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
+    )
+
+
+@router.post("/auth/teams/redeem", name="auth_teams_redeem")
+async def auth_teams_redeem(body: _TeamsRedeemBody):
+    from agentsmith_ui_auth.client import AuthClientError
+    try:
+        if not body.grant or len(body.grant) > 256:
+            raise AuthClientError("invalid_grant")
+        result = _teams_provider().client.redeem(grant=body.grant)
+    except AuthClientError as exc:
+        status = 503 if exc.code == "unavailable" else 400
+        raise HTTPException(status_code=status, detail="This login link is invalid or expired.") from exc
+    response = JSONResponse(
+        {"code": result["code"], "expires_in": _PENDING_MAX_AGE},
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+    response.set_cookie(
+        _PENDING_COOKIE,
+        result["pending"],
+        max_age=_PENDING_MAX_AGE,
+        secure=True,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@router.post("/auth/teams/pending", name="auth_teams_pending")
+async def auth_teams_pending(request: Request, body: _TeamsPendingBody):
+    from agentsmith_ui_auth.client import AuthClientError
+    provider = _teams_provider()
+    pending = request.cookies.get(_PENDING_COOKIE, "")
+    try:
+        value = provider.client.collect(pending=pending)
+    except AuthClientError as exc:
+        if exc.code in {"not_confirmed", "invalid_pending"}:
+            return JSONResponse(
+                {"ok": False, "status": "pending"}, status_code=202,
+                headers={"Cache-Control": "no-store"},
+            )
+        raise HTTPException(status_code=503, detail="Authentication service unavailable.") from exc
+    session = provider._session(value)
+    landing = _validate_post_login_target(body.next) or "/"
+    response = JSONResponse({"ok": True, "next": landing})
+    set_session_cookies(
+        response,
+        access_token=session.access_token,
+        refresh_token=session.refresh_token,
+        access_token_expires_in=max(60, session.expires_at - int(time.time())),
+        use_https=detect_https(request),
+        prefix=_prefix(request),
+        provider=session.provider,
+    )
+    response.delete_cookie(_PENDING_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    audit_log(
+        AuditEvent.LOGIN_SUCCESS,
+        provider="teams",
+        user_id=session.user_id,
+        org_id=session.org_id,
+        ip=_client_ip(request),
+    )
+    return response
+
+
+@router.post("/auth/teams/logout", name="auth_teams_logout")
+async def auth_teams_logout(request: Request):
+    access_token, _refresh = read_session_cookies(request)
+    if access_token:
+        try:
+            _teams_provider().logout_access(access_token)
+        except Exception as exc:
+            _log.warning("dashboard-auth: Teams session revocation failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503, detail="Authentication service unavailable."
+            ) from exc
+    response = JSONResponse({"ok": True})
+    clear_session_cookies(response, prefix=_prefix(request))
+    response.delete_cookie(_PENDING_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Public: provider list for the login-page bootstrap
 # ---------------------------------------------------------------------------
 
@@ -741,7 +886,18 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
 
 @router.post("/auth/logout", name="auth_logout")
 async def auth_logout(request: Request):
-    _at, rt = read_session_cookies(request)
+    at, rt = read_session_cookies(request)
+    sess = getattr(request.state, "session", None)
+    if at and sess is not None and sess.provider == "teams":
+        provider = get_provider("teams")
+        if provider is not None and hasattr(provider, "logout_access"):
+            try:
+                provider.logout_access(at)
+            except Exception as e:
+                _log.warning("dashboard-auth: Teams access revoke failed: %s", type(e).__name__)
+                raise HTTPException(
+                    status_code=503, detail="Authentication service unavailable."
+                ) from e
     if rt:
         # Best-effort revoke. Try every provider so a session minted by
         # any registered provider is revoked correctly. Failures are
@@ -755,7 +911,6 @@ async def auth_logout(request: Request):
                     provider.name, e,
                 )
 
-    sess = getattr(request.state, "session", None)
     audit_log(
         AuditEvent.LOGOUT,
         provider=(sess.provider if sess else "unknown"),
@@ -818,7 +973,21 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    import hashlib
+
+    access_token = str(sess.access_token or "")
+    session_key = str(getattr(sess, "session_key", "") or "")
+    if not session_key and access_token:
+        session_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    if not access_token or not session_key:
+        raise HTTPException(status_code=503, detail="Session cannot mint WebSocket tickets")
+    ticket = mint_ticket(
+        user_id=sess.user_id,
+        provider=sess.provider,
+        session_key=session_key,
+        org_id=sess.org_id,
+        access_token=access_token,
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

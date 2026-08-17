@@ -224,6 +224,20 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    app.state.live_authority_required = False
+
+    # Synchronize the durable revocation stream before any gated browser
+    # WebSocket can be accepted.  Failure is fail-closed for live authority
+    # while the background subscriber retries.
+    from hermes_cli.agentsmith_ui_auth_client import (
+        dashboard_client as _ui_auth_dashboard_client,
+        dashboard_configured as _ui_auth_dashboard_configured,
+    )
+    from hermes_cli.dashboard_auth.live_authority import LIVE_AUTHORITY
+    if getattr(app.state, "auth_required", False) and _ui_auth_dashboard_configured():
+        app.state.live_authority_required = True
+        LIVE_AUTHORITY.configure(_ui_auth_dashboard_client(), PTY_REGISTRY)
+        await LIVE_AUTHORITY.start()
 
     # Import hermes_cli.gateway eagerly *before* the lifespan yield so the
     # GIL-heavy .pyc compilation and Defender scan cost is absorbed during
@@ -265,6 +279,7 @@ async def _lifespan(app: "FastAPI"):
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
+        await LIVE_AUTHORITY.stop()
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
@@ -377,6 +392,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# HTTP middleware is not invoked for WebSocket upgrades.  A pure ASGI gate
+# therefore owns every gated browser WebSocket before any route handler can
+# accept it, including WebSockets supplied by bundled plugins.
+from hermes_cli.dashboard_auth.live_authority import WebSocketAuthorityMiddleware
+app.add_middleware(WebSocketAuthorityMiddleware)
+
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
 # /api/ is gated by the auth middleware below.
@@ -488,6 +509,14 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
     config/MCP/agent surface open to internet scanners.
     """
+    # A reverse proxy commonly terminates TLS in front of a loopback-bound
+    # dashboard.  In that deployment loopback describes only the proxy hop,
+    # not the trust boundary, so operators must be able to force the native
+    # cookie gate on without exposing uvicorn directly.
+    if os.environ.get("HERMES_DASHBOARD_REQUIRE_AUTH", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
     return host not in _LOOPBACK_HOST_VALUES
 
 
@@ -1796,6 +1825,8 @@ _SENSITIVE_MANAGED_DIR_NAMES = frozenset({
     "pairing",
 })
 
+_OPERATOR_FILE_DIRS = ("Uploads", "Documents", "Archive")
+
 
 def _is_sensitive_filename(name: str) -> bool:
     """Return True for a basename the managed-files API must never expose.
@@ -1838,6 +1869,14 @@ def _is_sensitive_path(path: Path) -> bool:
     if _is_sensitive_filename(path.name):
         return True
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
+
+
+def _is_hidden_managed_path(path: Path) -> bool:
+    return any(part.startswith(".") and part not in {".", ".."} for part in path.parts)
+
+
+def _managed_read_is_denied(path: Path) -> bool:
+    return _is_sensitive_path(path) or _is_hidden_managed_path(path)
 
 
 _FS_DATA_URL_MAX_BYTES = 16 * 1024 * 1024
@@ -2157,6 +2196,9 @@ def _managed_files_policy(request: Request, *, create_root: bool = True) -> Mana
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
         root = _ensure_managed_root(raw_forced_root) if create_root else _canonical_path(Path(raw_forced_root))
+        if create_root:
+            for name in _OPERATOR_FILE_DIRS:
+                _ensure_managed_root(root / name)
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
     # Remote/OAuth access does not imply a hosted container. Users can expose a
@@ -2358,7 +2400,7 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         entries = [
             _managed_file_entry(policy, child)
             for child in target.iterdir()
-            if not _is_sensitive_path(child)
+            if not _managed_read_is_denied(child)
         ]
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
@@ -2385,8 +2427,8 @@ async def read_managed_file(request: Request, path: str):
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Path is not a file")
-    if _is_sensitive_path(target):
-        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    if _managed_read_is_denied(target):
+        raise HTTPException(status_code=403, detail="Access to hidden or sensitive files is not allowed")
 
     try:
         size = target.stat().st_size
@@ -2429,8 +2471,8 @@ async def download_managed_file(request: Request, path: str):
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Path is not a file")
-    if _is_sensitive_path(target):
-        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    if _managed_read_is_denied(target):
+        raise HTTPException(status_code=403, detail="Access to hidden or sensitive files is not allowed")
 
     try:
         size = target.stat().st_size
@@ -14403,7 +14445,9 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
+from hermes_cli.pty_session import (  # noqa: E402
+    OwnerMismatch, PtySessionRegistry, RegistryFull, run_reaper,
+)
 
 PTY_REGISTRY = PtySessionRegistry(
     ttl=30 * 60,
@@ -14675,6 +14719,15 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
+        # The outer ASGI authority middleware already consumed and
+        # revalidated gated credentials.  Preserve this helper as the shared
+        # route seam without consuming a one-time ticket twice.
+        authority = (
+            (getattr(ws, "scope", {}) or {}).get("state") or {}
+        ).get("ws_authority") or {}
+        credential = authority.get("credential")
+        if credential in {"ticket", "internal"}:
+            return None, str(credential)
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
@@ -15744,13 +15797,21 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
+    from hermes_cli.dashboard_auth.live_authority import websocket_owner
+    live_owner = websocket_owner(ws)
     try:
         session, _created = await PTY_REGISTRY.attach_or_spawn(
-            attach_token, spawn=_spawn
+            attach_token, spawn=_spawn, owner=live_owner
         )
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
+        return
+    except OwnerMismatch:
+        await ws.send_text(
+            "\r\n\x1b[31mChat reattach denied for this browser session.\x1b[0m\r\n"
+        )
+        await ws.close(code=4403)
         return
     except (FileNotFoundError, OSError, RegistryFull) as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")

@@ -27,7 +27,13 @@ import html
 import json
 import logging
 import os
+import secrets
+import stat
+import tempfile
+import threading
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote
 
@@ -68,6 +74,7 @@ MessageActivity = None  # type: ignore[assignment,misc]
 ConversationReference = None  # type: ignore[assignment,misc]
 TypingActivityInput = None  # type: ignore[assignment,misc]
 AdaptiveCardInvokeActivity = None  # type: ignore[assignment,misc]
+FileConsentInvokeActivity = None  # type: ignore[assignment,misc]
 AdaptiveCardActionCardResponse = None  # type: ignore[assignment,misc]
 AdaptiveCardActionMessageResponse = None  # type: ignore[assignment,misc]
 AdaptiveCardInvokeResponse = None  # type: ignore[assignment,misc,union-attr]
@@ -79,6 +86,8 @@ HttpRouteHandler = None  # type: ignore[assignment,misc]
 AdaptiveCard = None  # type: ignore[assignment,misc]
 ExecuteAction = None  # type: ignore[assignment,misc]
 TextBlock = None  # type: ignore[assignment,misc]
+FileConsentCard = None  # type: ignore[assignment,misc]
+FileInfoCard = None  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -90,6 +99,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_media_bytes,
 )
+from hermes_constants import get_hermes_home
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -128,6 +138,388 @@ _MAX_BODY_BYTES = 1_048_576
 # (d542894ad). Pin a host via TEAMS_HOST or extra.host.
 _DEFAULT_HOST = None
 _WEBHOOK_PATH = "/api/messages"
+_USER_TARGET_PREFIX = "user:"
+_MAX_FILE_UPLOAD_BYTES = 25 * 1024 * 1024
+_FILE_UPLOAD_TTL_SECONDS = 60 * 60
+_FILE_CONSENT_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.consent"
+_FILE_INFO_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.info"
+_STORE_LOCK_TIMEOUT_SECONDS = 10
+_STORE_THREAD_LOCK = threading.RLock()
+_APPROVAL_TTL_SECONDS = 10 * 60
+_PENDING_APPROVAL_LOCK = threading.RLock()
+_PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
+
+
+def _record_pending_approval(
+    token: str, *, session_key: str, user_id: str, profile: str,
+    chat_id: str, command: str, description: str,
+) -> None:
+    now = time.time()
+    with _PENDING_APPROVAL_LOCK:
+        for key, item in list(_PENDING_APPROVALS.items()):
+            if float(item.get("expires_at", 0)) <= now:
+                _PENDING_APPROVALS.pop(key, None)
+        _PENDING_APPROVALS[token] = {
+            "session_key": session_key,
+            "user_id": user_id,
+            "profile": profile,
+            "chat_id": chat_id,
+            "command": command,
+            "description": description,
+            "expires_at": now + _APPROVAL_TTL_SECONDS,
+        }
+
+
+def _claim_pending_approval(token: str, *, user_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically consume an approval bound to its initiating user and DM."""
+    now = time.time()
+    with _PENDING_APPROVAL_LOCK:
+        pending = _PENDING_APPROVALS.get(token)
+        if (
+            not pending
+            or float(pending.get("expires_at", 0)) <= now
+            or pending.get("user_id") != user_id
+            or pending.get("chat_id") != chat_id
+        ):
+            if pending and float(pending.get("expires_at", 0)) <= now:
+                _PENDING_APPROVALS.pop(token, None)
+            return None
+        return _PENDING_APPROVALS.pop(token)
+
+
+def _discard_pending_approval(token: str) -> None:
+    with _PENDING_APPROVAL_LOCK:
+        _PENDING_APPROVALS.pop(token, None)
+
+
+@contextmanager
+def _locked_json_store(path: Path) -> Iterator[None]:
+    """Serialize one atomic JSON read-modify-write across gateway/CLI processes."""
+    lock_path = Path(f"{path}.lock")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _STORE_THREAD_LOCK:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        acquired = False
+        backend = ""
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+            except (AttributeError, OSError):
+                try:
+                    os.chmod(lock_path, 0o600)
+                except OSError:
+                    pass
+            deadline = time.monotonic() + _STORE_LOCK_TIMEOUT_SECONDS
+            while not acquired:
+                try:
+                    if os.name == "nt":  # pragma: no cover - Windows Teams host
+                        import msvcrt
+                        if os.fstat(descriptor).st_size == 0:
+                            os.write(descriptor, b"\0")
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                        backend = "msvcrt"
+                    else:
+                        import fcntl
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        backend = "fcntl"
+                    acquired = True
+                except (OSError, BlockingIOError):
+                    if time.monotonic() >= deadline:
+                        raise OSError(f"timed out locking Teams state store {path.name}")
+                    time.sleep(0.05)
+            yield
+        finally:
+            if acquired:
+                try:
+                    if backend == "msvcrt":  # pragma: no cover - Windows Teams host
+                        import msvcrt
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
+
+def _conversation_store_path() -> Path:
+    """Shared, operator-owned AAD-to-conversation route store."""
+    configured = os.getenv("TEAMS_CONVERSATION_STORE", "").strip()
+    if configured:
+        return Path(configured)
+    home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "teams" / "conversations.json"
+
+
+def _load_conversation_store() -> Dict[str, Dict[str, str]]:
+    path = _conversation_store_path()
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("[teams] Conversation route store is unreadable; ignoring it")
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("chat_id"), str)
+        and isinstance(item.get("service_url"), str)
+    }
+
+
+def _remember_conversation(user_id: str, chat_id: str, service_url: str) -> None:
+    """Atomically remember an authenticated Teams sender's proactive route."""
+    allowed = {item.strip() for item in os.getenv("TEAMS_ALLOWED_USERS", "").split(",") if item.strip()}
+    if not user_id or not chat_id or not service_url or user_id not in allowed:
+        return
+    normalized_url = _validate_teams_service_url(service_url)
+    if normalized_url is None:
+        logger.warning("[teams] Refusing conversation route with untrusted service URL")
+        return
+    path = _conversation_store_path()
+    try:
+        if path.is_symlink():
+            raise OSError("route store is a symlink")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        with _locked_json_store(path):
+            routes = _load_conversation_store()
+            routes[user_id] = {"chat_id": chat_id, "service_url": normalized_url}
+            descriptor, temporary = tempfile.mkstemp(prefix=".conversations-", dir=path.parent)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(routes, handle, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            except Exception:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+    except OSError:
+        logger.warning("[teams] Failed to persist proactive conversation route", exc_info=True)
+
+
+def _resolve_user_target(chat_id: str) -> tuple[str, Optional[str]]:
+    """Resolve a stable ``user:<AAD>`` target to conversation ID/service URL."""
+    if not chat_id.startswith(_USER_TARGET_PREFIX):
+        return chat_id, None
+    user_id = chat_id[len(_USER_TARGET_PREFIX):]
+    route = _load_conversation_store().get(user_id)
+    if not route:
+        return "", None
+    return route["chat_id"], route["service_url"]
+
+
+def _file_upload_store_path() -> Path:
+    configured = os.getenv("TEAMS_FILE_UPLOAD_STORE", "").strip()
+    if configured:
+        return Path(configured)
+    home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "teams" / "pending-uploads.json"
+
+
+def _file_upload_status_path() -> Path:
+    configured = os.getenv("TEAMS_FILE_UPLOAD_STATUS_STORE", "").strip()
+    if configured:
+        return Path(configured)
+    home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "teams" / "upload-status.json"
+
+
+def _allowed_file_upload_roots() -> tuple[Path, ...]:
+    """Return operator roots plus the active profile's document cache.
+
+    The generic MEDIA validator already treats ``cache/documents`` as the
+    profile-scoped artifact boundary. Mirror only the effective profile here;
+    never broaden Teams upload access to the shared jobs tree or sibling
+    profiles merely because the multiplex gateway can read them.
+    """
+    configured = os.getenv("TEAMS_FILE_UPLOAD_ROOTS", "")
+    roots = []
+    for value in configured.split(os.pathsep):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            root = Path(value).expanduser().resolve(strict=True)
+        except OSError:
+            continue
+        if root.is_dir() and not root.is_symlink():
+            roots.append(root)
+    try:
+        profile_documents = (Path(get_hermes_home()) / "cache" / "documents").resolve(
+            strict=True
+        )
+    except OSError:
+        profile_documents = None
+    if (
+        profile_documents is not None
+        and profile_documents.is_dir()
+        and not profile_documents.is_symlink()
+        and profile_documents not in roots
+    ):
+        roots.append(profile_documents)
+    return tuple(roots)
+
+
+def _validated_file_upload_path(path_value: str) -> Path:
+    roots = _allowed_file_upload_roots()
+    if not roots:
+        raise ValueError("Teams file upload roots are not configured")
+    path = Path(path_value).expanduser().resolve(strict=True)
+    if not any(path == root or path.is_relative_to(root) for root in roots):
+        raise ValueError("Teams file upload path is outside the approved roots")
+    return path
+
+
+def _load_file_uploads() -> Dict[str, Dict[str, Any]]:
+    path = _file_upload_store_path()
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("[teams] Pending upload store is unreadable; ignoring it")
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    now = time.time()
+    return {
+        str(token): item
+        for token, item in value.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("user_id"), str)
+        and isinstance(item.get("chat_id"), str)
+        and isinstance(item.get("expires_at"), (int, float))
+        and item["expires_at"] >= now
+    }
+
+
+def _write_file_uploads(uploads: Dict[str, Dict[str, Any]]) -> None:
+    path = _file_upload_store_path()
+    if path.is_symlink():
+        raise OSError("pending upload store is a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".pending-uploads-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(uploads, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _record_file_upload_status(token: str, status: str, **metadata: Any) -> None:
+    path = _file_upload_status_path()
+    if path.is_symlink():
+        raise OSError("upload status store is a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    with _locked_json_store(path):
+        try:
+            values = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            values = {}
+        if not isinstance(values, dict):
+            values = {}
+        cutoff = time.time() - (7 * 24 * 60 * 60)
+        values = {
+            key: item for key, item in values.items()
+            if isinstance(item, dict) and item.get("observed_at", 0) >= cutoff
+        }
+        values[token] = {"status": status, "observed_at": time.time(), **metadata}
+        descriptor, temporary = tempfile.mkstemp(prefix=".upload-status-", dir=path.parent)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(values, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+
+def _queue_file_upload(path_value: str, user_id: str, chat_id: str, file_name: str) -> str:
+    """Create a short-lived, sender-bound consent token for one regular file."""
+    path = _validated_file_upload_path(path_value)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError("Teams file upload requires a regular file")
+    if details.st_size > _MAX_FILE_UPLOAD_BYTES:
+        raise ValueError(f"Teams file upload exceeds {_MAX_FILE_UPLOAD_BYTES} bytes")
+    token = secrets.token_urlsafe(32)
+    store = _file_upload_store_path()
+    with _locked_json_store(store):
+        uploads = _load_file_uploads()
+        uploads[token] = {
+            "path": str(path),
+            "file_name": Path(file_name).name,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "size": details.st_size,
+            "device": details.st_dev,
+            "inode": details.st_ino,
+            "mtime_ns": details.st_mtime_ns,
+            "expires_at": time.time() + _FILE_UPLOAD_TTL_SECONDS,
+        }
+        _write_file_uploads(uploads)
+    return token
+
+
+def _claim_file_upload(token: str, user_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically consume a pending token bound to one sender/conversation."""
+    store = _file_upload_store_path()
+    with _locked_json_store(store):
+        uploads = _load_file_uploads()
+        pending = uploads.get(token)
+        if (
+            not pending
+            or pending.get("user_id") != user_id
+            or pending.get("chat_id") != chat_id
+        ):
+            return None
+        del uploads[token]
+        _write_file_uploads(uploads)
+        return pending
+
+
+def _user_for_chat(chat_id: str) -> str:
+    for user_id, route in _load_conversation_store().items():
+        if route.get("chat_id") == chat_id:
+            return user_id
+    return ""
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -391,7 +783,10 @@ class _AiohttpBridgeAdapter:
         """Register an SDK route handler as an aiohttp route."""
 
         async def _aiohttp_handler(request: "web.Request") -> "web.Response":
-            body = await request.json()
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, ValueError):
+                return web.Response(status=400)
             headers = dict(request.headers)
             result: "HttpResponse" = await handler(HttpRequest(body=body, headers=headers))
             status = result.get("status", 200)
@@ -557,7 +952,14 @@ async def _standalone_send(
     if not (client_id and client_secret and tenant_id):
         return {"error": "Teams standalone send: TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID are all required"}
 
+    resolved_chat_id, stored_service_url = _resolve_user_target(chat_id)
+    if chat_id.startswith(_USER_TARGET_PREFIX) and not resolved_chat_id:
+        return {"error": "Teams standalone send: no captured conversation for this AAD user; ask them to DM the bot once"}
+    chat_id = resolved_chat_id
+
     raw_service_url = (
+        stored_service_url
+        or
         os.getenv("TEAMS_SERVICE_URL")
         or extra.get("service_url", "")
         or _DEFAULT_TEAMS_SERVICE_URL
@@ -697,6 +1099,9 @@ def check_teams_requirements() -> bool:
             from microsoft_teams.api.activities.invoke.adaptive_card import (
                 AdaptiveCardInvokeActivity,
             )
+            from microsoft_teams.api.activities.invoke.file_consent import (
+                FileConsentInvokeActivity,
+            )
             from microsoft_teams.api.models.adaptive_card import (
                 AdaptiveCardActionCardResponse,
                 AdaptiveCardActionMessageResponse,
@@ -712,6 +1117,8 @@ def check_teams_requirements() -> bool:
                 HttpRouteHandler,
             )
             from microsoft_teams.cards import AdaptiveCard, ExecuteAction, TextBlock
+            from microsoft_teams.api.models.file.file_consent_card import FileConsentCard
+            from microsoft_teams.api.models.file.file_info_card import FileInfoCard
 
         return {
             "web": _web,
@@ -723,6 +1130,7 @@ def check_teams_requirements() -> bool:
             "ConversationReference": ConversationReference,
             "TypingActivityInput": TypingActivityInput,
             "AdaptiveCardInvokeActivity": AdaptiveCardInvokeActivity,
+            "FileConsentInvokeActivity": FileConsentInvokeActivity,
             "AdaptiveCardActionCardResponse": AdaptiveCardActionCardResponse,
             "AdaptiveCardActionMessageResponse": AdaptiveCardActionMessageResponse,
             "InvokeResponse": InvokeResponse,
@@ -734,6 +1142,8 @@ def check_teams_requirements() -> bool:
             "AdaptiveCard": AdaptiveCard,
             "ExecuteAction": ExecuteAction,
             "TextBlock": TextBlock,
+            "FileConsentCard": FileConsentCard,
+            "FileInfoCard": FileInfoCard,
             "TEAMS_SDK_AVAILABLE": True,
         }
 
@@ -743,6 +1153,9 @@ def check_teams_requirements() -> bool:
 
 
 class TeamsAdapter(BasePlatformAdapter):
+    # Dangerous-command approvals are routed to the initiating user's DM and
+    # must never fall back to a group/channel text prompt.
+    private_exec_approval_only = True
     """Microsoft Teams adapter using the microsoft-teams-apps SDK."""
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
@@ -766,6 +1179,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        self._conv_types: Dict[str, str] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Lazy-install the Teams SDK on demand (parity with Slack/Discord/etc.),
@@ -822,6 +1236,12 @@ class TeamsAdapter(BasePlatformAdapter):
                 ctx: ActivityContext[AdaptiveCardInvokeActivity],
             ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
                 return await self._on_card_action(ctx)
+
+            @self._app.on_file_consent
+            async def _handle_file_consent(
+                ctx: ActivityContext[FileConsentInvokeActivity],
+            ) -> InvokeResponse[None]:
+                return await self._on_file_consent(ctx)
 
             # initialize() calls register_route() on the bridge, which adds
             # POST /api/messages to aiohttp_app automatically
@@ -925,11 +1345,24 @@ class TeamsAdapter(BasePlatformAdapter):
             chat_type = "channel"
         else:
             chat_type = "dm"
+        if conv_id:
+            self._conv_types[str(conv_id)] = chat_type
 
         # Build source
         from_account = activity.from_
-        user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
+        literal_aad_object_id = getattr(from_account, "aad_object_id", None)
+        user_id = literal_aad_object_id or getattr(from_account, "id", "")
         user_name = getattr(from_account, "name", None) or ""
+        # Proactive ``user:<AAD>`` delivery may carry private reminders and
+        # documents. Never let a group/channel message replace the sender's
+        # previously captured personal conversation route.
+        if conv_type == "personal" and conv_id and user_id:
+            self._conv_refs[f"{_USER_TARGET_PREFIX}{user_id}"] = ctx.conversation_ref
+            _remember_conversation(
+                str(user_id),
+                str(conv_id),
+                str(getattr(activity, "service_url", "") or ""),
+            )
 
         source = self.build_source(
             chat_id=conv.id,
@@ -939,6 +1372,30 @@ class TeamsAdapter(BasePlatformAdapter):
             user_name=user_name,
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
         )
+
+        # Dashboard authentication commands are control-plane messages, not
+        # prompts.  Handle them after Teams supplied an authenticated AAD /
+        # tenant identity but before attachments, transcript persistence, or
+        # LLM dispatch.  Exact command parsing keeps ordinary prose out of the
+        # auth state machine.
+        if await self._handle_ui_auth_command(
+            ctx,
+            text=text,
+            conversation_type=conv_type,
+            conversation_id=str(conv_id or ""),
+            aad_object_id=str(literal_aad_object_id or ""),
+            tenant_id=str(getattr(conv, "tenant_id", None) or ""),
+        ):
+            return
+        if await self._handle_internal_auth_command(
+            ctx,
+            text=text,
+            conversation_type=conv_type,
+            conversation_id=str(conv_id or ""),
+            aad_object_id=str(literal_aad_object_id or ""),
+            tenant_id=str(getattr(conv, "tenant_id", None) or ""),
+        ):
+            return
 
         # Handle attachments (images, documents, video, audio)
         media_urls = []
@@ -1038,6 +1495,278 @@ class TeamsAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    async def _handle_ui_auth_command(
+        self,
+        ctx: ActivityContext[MessageActivity],
+        *,
+        text: str,
+        conversation_type: str,
+        conversation_id: str,
+        aad_object_id: str,
+        tenant_id: str,
+    ) -> bool:
+        """Handle the closed set of Teams UI-auth commands pre-LLM."""
+        import os
+        import re
+
+        command = " ".join((text or "").strip().split())
+        folded = command.casefold()
+        confirm = re.fullmatch(
+            r"ui confirm ([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{13})",
+            command,
+            flags=re.IGNORECASE,
+        )
+        is_confirm_command = folded == "ui confirm" or folded.startswith("ui confirm ")
+        if folded not in {"ui login", "ui logout", "ui status"} and not is_confirm_command:
+            return False
+
+        if conversation_type != "personal":
+            await ctx.send("For security, use this UI command in your private chat with AgentSmith.")
+            return True
+        if is_confirm_command and confirm is None:
+            await ctx.send("That UI authentication request could not be completed.")
+            return True
+
+        try:
+            from agentsmith_ui_auth.client import AuthClientError
+            from hermes_cli.agentsmith_ui_auth_client import issuer_client, issuer_configured
+
+            if not aad_object_id or not tenant_id or not conversation_id:
+                await ctx.send("That UI authentication request could not be completed.")
+                return True
+            if not issuer_configured():
+                await ctx.send("The AgentSmith UI login service is not configured yet.")
+                return True
+            client = issuer_client()
+            if folded == "ui login":
+                public_url = os.environ.get("HERMES_DASHBOARD_PUBLIC_URL", "").strip().rstrip("/")
+                if not public_url:
+                    await ctx.send("The AgentSmith UI login service is not configured yet.")
+                    return True
+                grant = client.issue(
+                    aad_object_id=aad_object_id,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )["grant"]
+                await ctx.send(
+                    "Open this one-time link within 2 minutes:\n"
+                    f"{public_url}/auth/teams/login#grant={grant}\n\n"
+                    "The page will show a code. Send `UI confirm <code>` here to finish."
+                )
+            elif confirm is not None:
+                client.confirm(
+                    aad_object_id=aad_object_id,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    code=confirm.group(1).upper(),
+                )
+                await ctx.send("UI login confirmed. The browser will open AgentSmith now.")
+            elif folded == "ui logout":
+                result = client.logout_principal(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id
+                )
+                count = int(result["revoked_sessions"])
+                await ctx.send(
+                    f"Signed out {count} AgentSmith browser session"
+                    f"{'s' if count != 1 else ''}."
+                )
+            else:
+                status = client.status(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id
+                )
+                await ctx.send(
+                    "AgentSmith UI: active." if status["active"]
+                    else "AgentSmith UI: no active session."
+                )
+        except AuthClientError:
+            await ctx.send("That UI authentication request could not be completed.")
+        except Exception:
+            logger.exception("[teams] UI auth command failed")
+            await ctx.send("AgentSmith could not complete that UI authentication command.")
+        return True
+
+    async def _handle_internal_auth_command(
+        self, ctx: ActivityContext[MessageActivity], *, text: str,
+        conversation_type: str, conversation_id: str,
+        aad_object_id: str, tenant_id: str,
+    ) -> bool:
+        """Handle the isolated internal-site auth command set before LLM dispatch."""
+        import os
+        import re
+        command = " ".join((text or "").strip().split())
+        folded = command.casefold()
+        confirm = re.fullmatch(
+            r"internal confirm ([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{13})",
+            command, flags=re.IGNORECASE,
+        )
+        is_confirm = folded == "internal confirm" or folded.startswith("internal confirm ")
+        if folded not in {"internal login", "internal logout", "internal status"} and not is_confirm:
+            return False
+        if conversation_type != "personal":
+            await ctx.send("For security, use this Internal command in your private chat with AgentSmith.")
+            return True
+        if is_confirm and confirm is None:
+            await ctx.send("That Internal authentication request could not be completed.")
+            return True
+        try:
+            from agentsmith_ui_auth.client import AuthClientError
+            from hermes_cli.agentsmith_ui_auth_client import (
+                internal_issuer_client, internal_issuer_configured,
+            )
+            if not aad_object_id or not tenant_id or not conversation_id:
+                await ctx.send("That Internal authentication request could not be completed.")
+                return True
+            if not internal_issuer_configured():
+                await ctx.send("The TBC Internal login service is not configured yet.")
+                return True
+            client = internal_issuer_client()
+            if folded == "internal login":
+                public_url = os.environ.get("AGENTSMITH_INTERNAL_PUBLIC_URL", "").strip().rstrip("/")
+                if not public_url:
+                    await ctx.send("The TBC Internal login service is not configured yet.")
+                    return True
+                grant = client.issue(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )["grant"]
+                await ctx.send(
+                    "Open this one-time link within 2 minutes:\n"
+                    f"{public_url}/auth/teams/login#grant={grant}\n\n"
+                    "The page will show a code. Send `Internal confirm <code>` here to finish."
+                )
+            elif confirm is not None:
+                client.confirm(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id,
+                    conversation_id=conversation_id, code=confirm.group(1).upper(),
+                )
+                await ctx.send("Internal login confirmed. The browser will open TBC Internal now.")
+            elif folded == "internal logout":
+                result = client.logout_principal(
+                    aad_object_id=aad_object_id, tenant_id=tenant_id,
+                )
+                count = int(result["revoked_sessions"])
+                await ctx.send(f"Signed out {count} TBC Internal browser session{'s' if count != 1 else ''}.")
+            else:
+                status = client.status(aad_object_id=aad_object_id, tenant_id=tenant_id)
+                await ctx.send(
+                    "TBC Internal: active." if status["active"]
+                    else "TBC Internal: no active session."
+                )
+        except AuthClientError:
+            await ctx.send("That Internal authentication request could not be completed.")
+        except Exception:
+            logger.exception("[teams] Internal auth command failed")
+            await ctx.send("AgentSmith could not complete that Internal authentication command.")
+        return True
+
+    async def _on_file_consent(
+        self, ctx: "ActivityContext[FileConsentInvokeActivity]"
+    ) -> "InvokeResponse[None]":
+        """Upload exactly the file represented by a sender-bound consent token."""
+        response = ctx.activity.value
+        action_value = getattr(response, "action", "")
+        action = str(getattr(action_value, "value", action_value)).lower()
+        context = getattr(response, "context", None) or {}
+        token = context.get("token", "") if isinstance(context, dict) else ""
+        if not token:
+            logger.warning("[teams] File consent response omitted its opaque token")
+            return InvokeResponse(status=200)
+
+        pending = _load_file_uploads().get(token)
+        if not pending:
+            await ctx.send("This file request expired. Ask AgentSmith to send it again.")
+            return InvokeResponse(status=200)
+
+        sender = ctx.activity.from_
+        sender_id = str(getattr(sender, "aad_object_id", None) or getattr(sender, "id", ""))
+        conversation_id = str(getattr(ctx.activity.conversation, "id", "") or "")
+        allowed = {item.strip() for item in os.getenv("TEAMS_ALLOWED_USERS", "").split(",") if item.strip()}
+        if sender_id not in allowed or sender_id != pending["user_id"] or conversation_id != pending["chat_id"]:
+            logger.warning("[teams] Rejected file consent token used by a different sender/conversation")
+            return InvokeResponse(status=200)
+
+        if action == "decline":
+            pending = _claim_file_upload(token, sender_id, conversation_id)
+            if not pending:
+                await ctx.send("This file request expired. Ask AgentSmith to send it again.")
+                return InvokeResponse(status=200)
+            _record_file_upload_status(token, "declined", file_name=pending["file_name"])
+            await ctx.send("File upload declined.")
+            return InvokeResponse(status=200)
+        if action != "accept":
+            return InvokeResponse(status=200)
+
+        upload = getattr(response, "upload_info", None)
+        upload_url = str(getattr(upload, "upload_url", "") or "")
+        content_url = str(getattr(upload, "content_url", "") or "")
+        unique_id = str(getattr(upload, "unique_id", "") or "")
+        if not upload_url or not content_url or not unique_id:
+            await ctx.send("Teams did not provide a complete upload target. Ask AgentSmith to try again.")
+            return InvokeResponse(status=200)
+
+        # Consume the sender-bound token before the first network await. A
+        # duplicate Teams callback can now observe only an expired/in-flight
+        # token and cannot upload or emit a second file-info card.
+        pending = _claim_file_upload(token, sender_id, conversation_id)
+        if not pending:
+            await ctx.send("This file request expired. Ask AgentSmith to send it again.")
+            return InvokeResponse(status=200)
+
+        path = Path(pending["path"])
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            try:
+                details = os.fstat(descriptor)
+                identity = (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+                expected = (
+                    pending["device"], pending["inode"], pending["size"], pending["mtime_ns"]
+                )
+                if not stat.S_ISREG(details.st_mode) or identity != expected:
+                    raise ValueError("file changed after consent was requested")
+                with os.fdopen(os.dup(descriptor), "rb") as handle:
+                    data = handle.read(_MAX_FILE_UPLOAD_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            if len(data) != pending["size"]:
+                raise ValueError("file size changed after consent was requested")
+
+            from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+            if not is_safe_url(upload_url):
+                raise ValueError("Teams supplied an unsafe upload URL")
+            async with create_ssrf_safe_async_client(timeout=30, follow_redirects=False) as client:
+                result = await client.put(
+                    upload_url,
+                    content=data,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(len(data)),
+                        "Content-Range": f"bytes 0-{len(data) - 1}/{len(data)}",
+                    },
+                )
+                result.raise_for_status()
+
+            from microsoft_teams.api import Attachment, MessageActivityInput
+            info = Attachment(
+                content_type=_FILE_INFO_CONTENT_TYPE,
+                content_url=content_url,
+                name=str(getattr(upload, "name", None) or pending["file_name"]),
+                content=FileInfoCard(
+                    unique_id=unique_id,
+                    file_type=str(getattr(upload, "file_type", "") or ""),
+                ),
+            )
+            await ctx.send(MessageActivityInput().add_attachments(info))
+            _record_file_upload_status(
+                token, "upload_complete",
+                file_name=pending["file_name"], unique_id=unique_id,
+            )
+        except Exception as exc:
+            logger.error("[teams] File consent upload failed: %s", exc, exc_info=True)
+            _record_file_upload_status(token, "failed", file_name=pending["file_name"])
+            await ctx.send("The file upload failed. Ask AgentSmith to send it again.")
+        return InvokeResponse(status=200)
+
     async def _send_card(self, chat_id: str, card: "AdaptiveCard") -> "Any":
         """Send an AdaptiveCard, using a stored ConversationReference when available."""
         from microsoft_teams.api import MessageActivityInput
@@ -1059,9 +1788,9 @@ class TeamsAdapter(BasePlatformAdapter):
         action = ctx.activity.value.action
         data = action.data or {}
         hermes_action = data.get("hermes_action", "")
-        session_key = data.get("session_key", "")
+        approval_token = data.get("approval_token", "")
 
-        if not hermes_action or not session_key:
+        if not hermes_action or not approval_token:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
@@ -1075,6 +1804,13 @@ class TeamsAdapter(BasePlatformAdapter):
         allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
         allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
 
+        from_account = ctx.activity.from_
+        clicker_id = str(
+            getattr(from_account, "aad_object_id", None)
+            or getattr(from_account, "id", "")
+        )
+        conversation_id = str(getattr(ctx.activity.conversation, "id", "") or "")
+
         if not allow_all:
             if not allowed_csv:
                 logger.warning(
@@ -1087,8 +1823,6 @@ class TeamsAdapter(BasePlatformAdapter):
                         value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
                     ),
                 )
-            from_account = ctx.activity.from_
-            clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
             if "*" not in allowed_ids and clicker_id not in allowed_ids:
                 logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
@@ -1110,6 +1844,21 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
+        pending = _claim_pending_approval(
+            str(approval_token), user_id=clicker_id, chat_id=conversation_id,
+        )
+        if pending is None:
+            logger.warning("[teams] Rejected approval token used by a different sender/conversation")
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
+                ),
+            )
+
+        session_key = str(pending["session_key"])
         if not has_blocking_approval(session_key):
             return InvokeResponse(
                 status=200,
@@ -1128,8 +1877,8 @@ class TeamsAdapter(BasePlatformAdapter):
             "always": "✅ Always allowed",
             "deny": "❌ Denied",
         }
-        cmd = data.get("cmd", "")
-        desc = data.get("desc", "")
+        cmd = str(pending.get("command", ""))
+        desc = str(pending.get("description", ""))
         body = []
         if cmd:
             body.append(TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"))
@@ -1160,12 +1909,33 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        metadata = metadata or {}
+        requester_id = str(metadata.get("requester_user_id") or "")
+        requester_profile = str(metadata.get("requester_profile") or "")
+        allowed_ids = {
+            item.strip() for item in os.getenv("TEAMS_ALLOWED_USERS", "").split(",")
+            if item.strip()
+        }
+        resolved_chat_id, _ = _resolve_user_target(f"{_USER_TARGET_PREFIX}{requester_id}")
+        if requester_id not in allowed_ids or not requester_profile or not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="Teams command approval requires the requester's captured personal chat",
+            )
+
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        # Truncated for button data payload — just enough to reconstruct the card body.
+        approval_token = secrets.token_urlsafe(32)
+        _record_pending_approval(
+            approval_token,
+            session_key=session_key,
+            user_id=requester_id,
+            profile=requester_profile,
+            chat_id=resolved_chat_id,
+            command=command,
+            description=description,
+        )
         btn_data_base = {
-            "session_key": session_key,
-            "cmd": command[:200] + "..." if len(command) > 200 else command,
-            "desc": description,
+            "approval_token": approval_token,
         }
 
         actions = [ExecuteAction(
@@ -1198,10 +1968,11 @@ class TeamsAdapter(BasePlatformAdapter):
         card = AdaptiveCard().with_version("1.4").with_body(body).with_actions(actions)
 
         try:
-            result = await self._send_card(chat_id, card)
+            result = await self._send_card(resolved_chat_id, card)
             message_id = getattr(result, "id", None) if result else None
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
+            _discard_pending_approval(approval_token)
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 
@@ -1215,6 +1986,14 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        resolved_chat_id, _ = _resolve_user_target(chat_id)
+        if chat_id.startswith(_USER_TARGET_PREFIX) and not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="No captured Teams conversation for this user; ask them to DM the bot once",
+            )
+        if resolved_chat_id:
+            chat_id = resolved_chat_id
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted)
         last_message_id = None
@@ -1256,6 +2035,7 @@ class TeamsAdapter(BasePlatformAdapter):
         default_mime: str,
         caption: Optional[str] = None,
         media_label: str = "media",
+        file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file/URL as a Teams attachment.
 
@@ -1268,6 +2048,16 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        original_chat_id = chat_id
+        resolved_chat_id, _ = _resolve_user_target(chat_id)
+        if chat_id.startswith(_USER_TARGET_PREFIX) and not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="No captured Teams conversation for this user; ask them to DM the bot once",
+            )
+        if resolved_chat_id:
+            chat_id = resolved_chat_id
+
         try:
             import base64
             import mimetypes
@@ -1277,9 +2067,56 @@ class TeamsAdapter(BasePlatformAdapter):
                 content_url = source
                 mime_type = mimetypes.guess_type(source.split("?")[0])[0] or default_mime
             else:
-                # Local path — encode as base64 data URI
                 path = source.removeprefix("file://")
                 mime_type = mimetypes.guess_type(path)[0] or default_mime
+                if media_label == "document":
+                    user_id = (
+                        original_chat_id[len(_USER_TARGET_PREFIX):]
+                        if original_chat_id.startswith(_USER_TARGET_PREFIX)
+                        else _user_for_chat(chat_id)
+                    )
+                    if not user_id:
+                        return SendResult(
+                            success=False,
+                            error="Teams document delivery requires a captured personal conversation",
+                        )
+                    if self._conv_types.get(chat_id, "dm") != "dm":
+                        return SendResult(
+                            success=False,
+                            error="Teams FileConsent document delivery is supported only in personal chats",
+                        )
+                    consent_name = Path(file_name or path).name
+                    token = _queue_file_upload(path, user_id, chat_id, consent_name)
+                    consent = Attachment(
+                        content_type=_FILE_CONSENT_CONTENT_TYPE,
+                        name=consent_name,
+                        content=FileConsentCard(
+                            description=caption or "AgentSmith generated file",
+                            size_in_bytes=Path(path).stat().st_size,
+                            accept_context={"token": token},
+                            decline_context={"token": token},
+                        ),
+                    )
+                    activity = MessageActivityInput().add_attachments(consent)
+                    if caption:
+                        activity = activity.add_text(caption)
+                    conv_ref = self._conv_refs.get(original_chat_id) or self._conv_refs.get(chat_id)
+                    if conv_ref:
+                        result = await self._app.activity_sender.send(activity, conv_ref)
+                    else:
+                        result = await self._app.send(chat_id, activity)
+                    return SendResult(
+                        success=True,
+                        message_id=getattr(result, "id", None),
+                        raw_response={
+                            "deliveryStatus": "file_consent_requested",
+                            "terminal": False,
+                            "pendingUploadId": token,
+                        },
+                    )
+
+                # Local inline media — encode as a data URI. Generated documents
+                # use FileConsent above; this path is retained for small images/audio.
                 with open(path, "rb") as f:
                     content_url = f"data:{mime_type};base64,{base64.b64encode(f.read()).decode()}"
 
@@ -1288,7 +2125,7 @@ class TeamsAdapter(BasePlatformAdapter):
             if caption:
                 activity = activity.add_text(caption)
 
-            conv_ref = self._conv_refs.get(chat_id)
+            conv_ref = self._conv_refs.get(original_chat_id) or self._conv_refs.get(chat_id)
             if conv_ref:
                 result = await self._app.activity_sender.send(activity, conv_ref)
             else:
@@ -1380,6 +2217,7 @@ class TeamsAdapter(BasePlatformAdapter):
             default_mime="application/octet-stream",
             caption=caption,
             media_label="document",
+            file_name=file_name,
         )
 
     async def get_chat_info(self, chat_id: str) -> dict:

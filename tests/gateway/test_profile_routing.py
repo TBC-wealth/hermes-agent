@@ -22,6 +22,13 @@ class TestProfileRoute:
 
 
 class TestProfileRouteMatching:
+    def test_verified_sender_route(self):
+        r = ProfileRoute(name="user", platform="teams", profile="alberto",
+                         user_id="aad-alberto")
+        assert r.specificity == 16
+        assert r.matches("teams", user_id="aad-alberto")
+        assert not r.matches("teams", user_id="aad-jenny")
+
     def test_exact_thread_match(self):
         r = ProfileRoute(name="t", platform="discord", profile="trader",
                          guild_id="111", chat_id="222", thread_id="333")
@@ -49,6 +56,15 @@ class TestParseProfileRoutes:
     def test_empty(self):
         assert parse_profile_routes(None) == []
         assert parse_profile_routes([]) == []
+
+    def test_user_id_is_parsed(self):
+        routes = parse_profile_routes([{
+            "name": "alberto",
+            "platform": "teams",
+            "profile": "alberto",
+            "user_id": "aad-alberto",
+        }])
+        assert routes[0].user_id == "aad-alberto"
 
 
 class TestMatchProfileRoute:

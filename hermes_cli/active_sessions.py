@@ -261,6 +261,8 @@ class ActiveSessionLease:
     surface: str
     enabled: bool = True
     released: bool = False
+    state_path: Optional[Path] = None
+    lock_path: Optional[Path] = None
 
     def release(self) -> None:
         if self.released or not self.enabled:
@@ -306,7 +308,8 @@ def try_acquire_active_session(
         }
 
     state_path = _state_path()
-    with _FileLock(_lock_path()):
+    lock_path = _lock_path()
+    with _FileLock(lock_path):
         raw_entries = _read_entries(state_path)
         entries = _prune_dead(raw_entries)
         pruned = len(raw_entries) - len(entries)
@@ -331,23 +334,38 @@ def try_acquire_active_session(
         lease_id=lease_id,
         session_id=str(session_id),
         surface=str(surface),
+        state_path=state_path,
+        lock_path=lock_path,
     ), None
 
 
+def _lease_paths(lease: ActiveSessionLease) -> tuple[Path, Path]:
+    """Return the registry paths fixed when the lease was acquired.
+
+    Routed gateway turns temporarily change the effective Hermes home to the
+    user's profile. A lease belongs to the registry that granted it, not the
+    profile that happens to be active when teardown or transfer runs.
+    """
+    return (
+        lease.state_path if lease.state_path is not None else _state_path(),
+        lease.lock_path if lease.lock_path is not None else _lock_path(),
+    )
+
+
 def release_active_session(lease: ActiveSessionLease) -> None:
-    state_path = _state_path()
-    try:
-        with _FileLock(_lock_path()):
-            entries = _prune_dead(_read_entries(state_path))
-            kept = [
-                entry
-                for entry in entries
-                if str(entry.get("lease_id") or "") != lease.lease_id
-            ]
-            if len(kept) != len(entries):
-                _write_entries(state_path, kept)
-    finally:
-        lease.released = True
+    state_path, lock_path = _lease_paths(lease)
+    with _FileLock(lock_path):
+        entries = _prune_dead(_read_entries(state_path))
+        kept = [
+            entry
+            for entry in entries
+            if str(entry.get("lease_id") or "") != lease.lease_id
+        ]
+        if len(kept) != len(entries):
+            _write_entries(state_path, kept)
+    # Do not make a failed release unretriable. This flag is set only after the
+    # registry operation succeeds (including the already-absent/idempotent case).
+    lease.released = True
 
 
 def transfer_active_session(
@@ -366,8 +384,8 @@ def transfer_active_session(
         lease.session_id = new_session_id
         return True
 
-    state_path = _state_path()
-    with _FileLock(_lock_path()):
+    state_path, lock_path = _lease_paths(lease)
+    with _FileLock(lock_path):
         entries = _prune_dead(_read_entries(state_path))
         updated = False
         for entry in entries:
