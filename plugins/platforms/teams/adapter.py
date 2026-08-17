@@ -1734,7 +1734,8 @@ class TeamsAdapter(BasePlatformAdapter):
                 )
                 if not stat.S_ISREG(details.st_mode) or identity != expected:
                     raise ValueError("file changed after consent was requested")
-                with os.fdopen(os.dup(descriptor), "rb") as handle:
+                # Binary mode has no platform encoding to specify.
+                with os.fdopen(os.dup(descriptor), "rb") as handle:  # windows-footgun: ok
                     data = handle.read(_MAX_FILE_UPLOAD_BYTES + 1)
             finally:
                 os.close(descriptor)

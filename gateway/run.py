@@ -2112,10 +2112,11 @@ def _claim_agentsmith_profile_welcome(profile_home: "Path") -> bool:
     try:
         welcome_flag.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory = welcome_flag.parent.lstat()
+        effective_uid = getattr(os, "geteuid", None)
         if (
             welcome_flag.parent.is_symlink()
             or not stat.S_ISDIR(directory.st_mode)
-            or directory.st_uid != os.geteuid()
+            or (effective_uid is not None and directory.st_uid != effective_uid())
         ):
             raise OSError("profile first-contact directory is unsafe")
         os.chmod(welcome_flag.parent, 0o700)
