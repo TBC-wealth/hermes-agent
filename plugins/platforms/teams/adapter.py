@@ -29,7 +29,11 @@ import json
 import logging
 import os
 import sys
+import tempfile
+import threading
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote
 
@@ -130,6 +134,138 @@ _MAX_BODY_BYTES = 1_048_576
 # (d542894ad). Pin a host via TEAMS_HOST or extra.host.
 _DEFAULT_HOST = None
 _WEBHOOK_PATH = "/api/messages"
+_USER_TARGET_PREFIX = "user:"
+_STORE_LOCK_TIMEOUT_SECONDS = 10
+_STORE_THREAD_LOCK = threading.RLock()
+
+
+@contextmanager
+def _locked_json_store(path: Path) -> Iterator[None]:
+    """Serialize one atomic JSON read-modify-write across gateway/CLI processes."""
+    lock_path = Path(f"{path}.lock")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _STORE_THREAD_LOCK:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        acquired = False
+        backend = ""
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+            except (AttributeError, OSError):
+                try:
+                    os.chmod(lock_path, 0o600)
+                except OSError:
+                    pass
+            deadline = time.monotonic() + _STORE_LOCK_TIMEOUT_SECONDS
+            while not acquired:
+                try:
+                    if os.name == "nt":  # pragma: no cover - Windows Teams host
+                        import msvcrt
+                        if os.fstat(descriptor).st_size == 0:
+                            os.write(descriptor, b"\0")
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                        backend = "msvcrt"
+                    else:
+                        import fcntl
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        backend = "fcntl"
+                    acquired = True
+                except (OSError, BlockingIOError):
+                    if time.monotonic() >= deadline:
+                        raise OSError(f"timed out locking Teams state store {path.name}")
+                    time.sleep(0.05)
+            yield
+        finally:
+            if acquired:
+                try:
+                    if backend == "msvcrt":  # pragma: no cover - Windows Teams host
+                        import msvcrt
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
+
+def _conversation_store_path() -> Path:
+    """Shared, operator-owned AAD-to-conversation route store."""
+    configured = os.getenv("TEAMS_CONVERSATION_STORE", "").strip()
+    if configured:
+        return Path(configured)
+    home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "teams" / "conversations.json"
+
+
+def _load_conversation_store() -> Dict[str, Dict[str, str]]:
+    path = _conversation_store_path()
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("[teams] Conversation route store is unreadable; ignoring it")
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("chat_id"), str)
+        and isinstance(item.get("service_url"), str)
+    }
+
+
+def _remember_conversation(user_id: str, chat_id: str, service_url: str) -> None:
+    """Atomically remember an authenticated Teams sender's proactive route."""
+    allowed = {item.strip() for item in os.getenv("TEAMS_ALLOWED_USERS", "").split(",") if item.strip()}
+    if not user_id or not chat_id or not service_url or user_id not in allowed:
+        return
+    normalized_url = _validate_teams_service_url(service_url)
+    if normalized_url is None:
+        logger.warning("[teams] Refusing conversation route with untrusted service URL")
+        return
+    path = _conversation_store_path()
+    try:
+        if path.is_symlink():
+            raise OSError("route store is a symlink")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        with _locked_json_store(path):
+            routes = _load_conversation_store()
+            routes[user_id] = {"chat_id": chat_id, "service_url": normalized_url}
+            descriptor, temporary = tempfile.mkstemp(prefix=".conversations-", dir=path.parent)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(routes, handle, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            except Exception:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+    except OSError:
+        logger.warning("[teams] Failed to persist proactive conversation route", exc_info=True)
+
+
+def _resolve_user_target(chat_id: str) -> tuple[str, Optional[str]]:
+    """Resolve a stable ``user:<AAD>`` target to conversation ID/service URL."""
+    if not chat_id.startswith(_USER_TARGET_PREFIX):
+        return chat_id, None
+    user_id = chat_id[len(_USER_TARGET_PREFIX):]
+    route = _load_conversation_store().get(user_id)
+    if not route:
+        return "", None
+    return route["chat_id"], route["service_url"]
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -564,7 +700,14 @@ async def _standalone_send(
     if not (client_id and client_secret and tenant_id):
         return {"error": "Teams standalone send: TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID are all required"}
 
+    resolved_chat_id, stored_service_url = _resolve_user_target(chat_id)
+    if chat_id.startswith(_USER_TARGET_PREFIX) and not resolved_chat_id:
+        return {"error": "Teams standalone send: no captured conversation for this AAD user; ask them to DM the bot once"}
+    chat_id = resolved_chat_id
+
     raw_service_url = (
+        stored_service_url
+        or
         os.getenv("TEAMS_SERVICE_URL")
         or extra.get("service_url", "")
         or _DEFAULT_TEAMS_SERVICE_URL
@@ -940,6 +1083,16 @@ class TeamsAdapter(BasePlatformAdapter):
         from_account = activity.from_
         user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
         user_name = getattr(from_account, "name", None) or ""
+        # Proactive ``user:<AAD>`` delivery may carry private reminders and
+        # documents. Never let a group/channel message replace the sender's
+        # previously captured personal conversation route.
+        if conv_type == "personal" and conv_id and user_id:
+            self._conv_refs[f"{_USER_TARGET_PREFIX}{user_id}"] = ctx.conversation_ref
+            _remember_conversation(
+                str(user_id),
+                str(conv_id),
+                str(getattr(activity, "service_url", "") or ""),
+            )
 
         source = self.build_source(
             chat_id=conv.id,
@@ -1225,6 +1378,14 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        resolved_chat_id, _ = _resolve_user_target(chat_id)
+        if chat_id.startswith(_USER_TARGET_PREFIX) and not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="No captured Teams conversation for this user; ask them to DM the bot once",
+            )
+        if resolved_chat_id:
+            chat_id = resolved_chat_id
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted)
         last_message_id = None
@@ -1278,6 +1439,16 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        original_chat_id = chat_id
+        resolved_chat_id, _ = _resolve_user_target(chat_id)
+        if chat_id.startswith(_USER_TARGET_PREFIX) and not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="No captured Teams conversation for this user; ask them to DM the bot once",
+            )
+        if resolved_chat_id:
+            chat_id = resolved_chat_id
+
         try:
             import base64
             import mimetypes
@@ -1298,7 +1469,7 @@ class TeamsAdapter(BasePlatformAdapter):
             if caption:
                 activity = activity.add_text(caption)
 
-            conv_ref = self._conv_refs.get(chat_id)
+            conv_ref = self._conv_refs.get(original_chat_id) or self._conv_refs.get(chat_id)
             if conv_ref:
                 result = await self._app.activity_sender.send(activity, conv_ref)
             else:
