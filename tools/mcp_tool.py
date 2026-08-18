@@ -4942,6 +4942,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        # Flag set by _call() when the underlying tool returned isError.
+        # The RPC round-trip succeeded either way, so a tool-level error
+        # MUST NOT trip the per-server circuit breaker. The transport
+        # was demonstrably healthy — the error was the tool's own
+        # response (bad agent parameters, validation failure, etc.).
+        tool_error_encountered = False
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -4962,6 +4969,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 _mark_proven()
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
+                # Flag this as a tool-level error so the outer handler
+                # doesn't count it against the per-server circuit breaker.
+                # The completed RPC round-trip already proved the transport
+                # is healthy; bumping the breaker here would short-circuit
+                # every subsequent call after N consecutive tool-level
+                # errors (e.g. agent passing bad parameters) — even though
+                # the underlying server is fine.
+                nonlocal tool_error_encountered
+                tool_error_encountered = True
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
@@ -5049,7 +5065,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    if tool_error_encountered:
+                        # Tool-level error (the RPC round-trip succeeded
+                        # and the tool itself returned isError). The
+                        # transport is demonstrably healthy, so the
+                        # completed round-trip is an unambiguous success
+                        # signal — reset the breaker instead of bumping.
+                        _reset_server_error(server_name)
+                    else:
+                        _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
