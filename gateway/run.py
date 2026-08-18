@@ -1893,6 +1893,48 @@ def _claim_agentsmith_profile_welcome(profile_home: "Path") -> bool:
         return False
 
 
+def _discover_multiplex_profile_mcp_tools(config) -> None:
+    """Register every served profile's ``mcp_servers`` under its runtime scope.
+
+    Gateway startup runs ``discover_mcp_tools()`` once in the process-global
+    (default) scope, so only the default profile's ``mcp_servers`` are
+    registered. Under ``gateway.multiplex_profiles`` each secondary profile
+    typically declares its own servers (for example a per-user connector) and
+    the per-session agents built for routed inbound turns snapshot the tool
+    registry at construction time — so without this pass they never see
+    ``mcp__<server>__*`` tools. Only cron (which discovers under its own
+    profile scope) would register them, as a side effect and too late for
+    agents already built.
+
+    Discover under each served profile's ``_profile_runtime_scope`` so the
+    profile's config, schema cache and secret scope apply. Lazy servers
+    register from the schema cache without connecting; eager servers connect
+    as they would for a single-profile gateway. Server names are global in
+    the tool registry, so profiles must not share a server name unless they
+    mean the same server. Failures are per-profile and never abort startup.
+    """
+    if not getattr(config, "multiplex_profiles", False):
+        return
+    try:
+        from hermes_cli.profiles import profiles_to_serve
+        from tools.mcp_tool import discover_mcp_tools
+    except Exception as exc:  # pragma: no cover - import guard
+        logger.debug("Multiplex MCP discovery unavailable: %s", exc)
+        return
+    try:
+        profile_homes = list(profiles_to_serve(multiplex=True))
+    except Exception as exc:
+        logger.warning("Could not resolve profile homes for multiplex MCP discovery: %s", exc)
+        return
+    for entry in profile_homes:
+        name, home = entry if isinstance(entry, tuple) else (str(entry), entry)
+        try:
+            with _profile_runtime_scope(Path(home)):
+                discover_mcp_tools()
+        except Exception as exc:
+            logger.warning("MCP discovery failed for profile %r: %s", name, exc)
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -26623,6 +26665,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _loop.run_in_executor(None, discover_mcp_tools)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
+
+    # Multiplex profiles: the discovery above only saw the default profile's
+    # ``mcp_servers``. Register each served profile's servers under its own
+    # scope before any per-session agent is built (see helper docstring).
+    try:
+        _loop = asyncio.get_running_loop()
+        await _loop.run_in_executor(
+            None, _discover_multiplex_profile_mcp_tools, runner.config
+        )
+    except Exception as e:
+        logger.debug("Multiplex profile MCP discovery failed: %s", e)
 
     # Start the gateway
     try:
