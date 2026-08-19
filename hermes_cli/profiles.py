@@ -697,7 +697,7 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
 
 
-def _check_gateway_running(profile_dir: Path) -> bool:
+def _check_gateway_running(profile_dir: Path, *, _multiplex_redirected: bool = False) -> bool:
     """Check if a gateway is running for a given profile directory.
 
     Primary signal is the profile's ``gateway.pid`` (verified against the
@@ -709,6 +709,16 @@ def _check_gateway_running(profile_dir: Path) -> bool:
     in the profile's own ``gateway_state.json`` against the live process table,
     mirroring the ``/api/status`` sidebar's liveness logic so the two surfaces
     agree.  Parameterized by ``profile_dir`` so it never mutates ``HERMES_HOME``.
+
+    Under ``gateway.multiplex_profiles``, served profiles never run their own
+    gateway process — they have no ``gateway.pid`` / ``gateway_state.json`` of
+    their own, so both checks above always fail and every served profile would
+    otherwise show "Gateway stopped" even while the root multiplexer is happily
+    serving it (agentsmith #94 item 4). When *profile_dir* is one of the
+    profiles the multiplexer serves (:func:`profiles_to_serve`), fall back to
+    the root home's own liveness instead. ``_multiplex_redirected`` guards that
+    recursive call against looping back into itself when *profile_dir* already
+    IS the root.
     """
     try:
         from gateway.status import get_running_pid
@@ -725,7 +735,26 @@ def _check_gateway_running(profile_dir: Path) -> bool:
             read_runtime_status,
         )
         runtime = read_runtime_status(profile_dir / "gateway_state.json")
-        return get_runtime_status_running_pid(runtime, expected_home=profile_dir) is not None
+        if get_runtime_status_running_pid(runtime, expected_home=profile_dir) is not None:
+            return True
+    except Exception:
+        pass
+
+    if _multiplex_redirected:
+        return False
+
+    try:
+        from gateway.config import load_gateway_config
+        config = load_gateway_config()
+        if not getattr(config, "multiplex_profiles", False):
+            return False
+        root_home = _get_default_hermes_home()
+        if root_home.resolve() == profile_dir.resolve():
+            return False
+        served_dirs = {home.resolve() for _, home in profiles_to_serve(multiplex=True)}
+        if profile_dir.resolve() not in served_dirs:
+            return False
+        return _check_gateway_running(root_home, _multiplex_redirected=True)
     except Exception:
         return False
 
@@ -735,10 +764,11 @@ def _check_gateway_running(profile_dir: Path) -> bool:
 # sub-trees); the default profile alone has ~270 skills, and ``list_profiles``
 # calls this for EVERY profile (16+), so an uncached scan costs ~6s — long
 # enough that the desktop's per-request backend calls time out and the sidebar
-# renders "全部智能体 0". We cache the count keyed by the skills dir, invalidated
-# when the dir tree's signature (skills_dir + immediate category dirs mtimes)
-# changes (catches skill add/remove) or after a short TTL (catches deep edits).
-_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+# renders "全部智能体 0". We cache the count keyed by the profile dir, invalidated
+# when the combined signature (local skills_dir + every configured external
+# dir, each keyed by its own mtime + immediate children mtimes) changes
+# (catches skill add/remove) or after a short TTL (catches deep edits).
+_SKILL_COUNT_CACHE: dict[str, tuple[tuple, float, int]] = {}
 _SKILL_COUNT_TTL_SECONDS = 30.0
 
 
@@ -769,14 +799,89 @@ def _skills_dir_signature(skills_dir: Path) -> float:
     return sig
 
 
+def _external_skill_dirs_for_profile(profile_dir: Path) -> List[Path]:
+    """Read ``skills.external_dirs`` from *profile_dir*'s own ``config.yaml``.
+
+    Mirrors :func:`agent.skill_utils.get_external_skills_dirs`, but is
+    parameterized by an arbitrary profile directory instead of the current
+    (context-scoped) ``HERMES_HOME`` — this is read while iterating every
+    profile for ``hermes profile list`` / the dashboard, and must never
+    mutate ``HERMES_HOME`` to do it. Relative entries resolve against
+    *profile_dir* (that profile's own home), not the caller's. Only
+    existing directories are returned; the profile's own local ``skills/``
+    dir is excluded so it's never double-counted.
+    """
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return []
+    try:
+        from hermes_cli.config import read_user_config_raw
+        cfg = read_user_config_raw(config_path)
+    except Exception:
+        return []
+
+    skills_cfg = cfg.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return []
+    raw_dirs = skills_cfg.get("external_dirs")
+    if not raw_dirs:
+        return []
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if not isinstance(raw_dirs, list):
+        return []
+
+    local_skills = (profile_dir / "skills").resolve()
+    seen: set = set()
+    result: List[Path] = []
+    for entry in raw_dirs:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        p = Path(expanded)
+        if not p.is_absolute():
+            p = (profile_dir / p).resolve()
+        else:
+            p = p.resolve()
+        if p == local_skills or p in seen:
+            continue
+        if p.is_dir():
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+def _iter_skill_md_no_symlinks(root_dir: Path):
+    """Yield every ``SKILL.md`` under *root_dir*, never following symlinked dirs.
+
+    External skill dirs (``skills.external_dirs``) are user-configured paths
+    outside the profile's own tree; a symlinked subdirectory inside one could
+    point anywhere on disk, so the walk stays strictly inside *root_dir* by
+    refusing to descend into symlinked directories (``os.walk(followlinks=False)``,
+    the default).
+    """
+    for dirpath, _dirnames, filenames in os.walk(root_dir, followlinks=False):
+        if "SKILL.md" in filenames:
+            yield Path(dirpath) / "SKILL.md"
+
+
 def _count_skills(profile_dir: Path) -> int:
-    """Count installed skills in a profile (cached by skills-dir signature)."""
+    """Count installed skills in a profile: local ``skills/`` plus any
+    configured ``skills.external_dirs`` (cached by combined dir signature).
+
+    Standard (non-default) profiles keep their local ``skills/`` empty by
+    design — skills are provided via ``skills.external_dirs`` instead — so
+    counting only the local dir under-reports (agentsmith #94 item 4).
+    """
     skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
+    external_dirs = _external_skill_dirs_for_profile(profile_dir)
+    if not skills_dir.is_dir() and not external_dirs:
         return 0
 
-    key = str(skills_dir)
-    signature = _skills_dir_signature(skills_dir)
+    all_dirs = ([skills_dir] if skills_dir.is_dir() else []) + external_dirs
+    key = str(profile_dir)
+    signature = tuple(sorted((str(d), _skills_dir_signature(d)) for d in all_dirs))
     now = time.time()
     cached = _SKILL_COUNT_CACHE.get(key)
     if (
@@ -787,10 +892,16 @@ def _count_skills(profile_dir: Path) -> int:
         return cached[2]
 
     count = 0
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        count += 1
+    if skills_dir.is_dir():
+        for md in skills_dir.rglob("SKILL.md"):
+            if is_excluded_skill_path(md):
+                continue
+            count += 1
+    for ext_dir in external_dirs:
+        for md in _iter_skill_md_no_symlinks(ext_dir):
+            if is_excluded_skill_path(md):
+                continue
+            count += 1
     _SKILL_COUNT_CACHE[key] = (signature, now, count)
     return count
 

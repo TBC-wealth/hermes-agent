@@ -47,3 +47,46 @@ class TestBackgroundTaskProfileScope:
         inner.assert_awaited_once()
 
 
+class TestBackgroundTaskFailClosed:
+    """A missing/unresolvable routed profile refuses the background task
+    outright instead of falling back to the root identity (agentsmith #94
+    item 2) — this is fire-and-forget, so there is no caller to hand a
+    reply to; the fix notifies the chat directly and never runs the task.
+    """
+
+    def test_profile_resolution_error_skips_inner_and_notifies_chat(self):
+        from gateway.run import ProfileResolutionError
+
+        runner = _make_runner(multiplex=True)
+        inner = mock.AsyncMock(return_value=None)
+        runner._run_background_task_inner = inner
+
+        fake_adapter = mock.AsyncMock()
+        runner._adapter_for_source = mock.MagicMock(return_value=fake_adapter)
+        runner._thread_metadata_for_source = mock.MagicMock(return_value={})
+
+        source = mock.MagicMock()
+        source.profile = "missing"
+        source.platform.value = "discord"
+        source.chat_id = "123"
+
+        with mock.patch.object(
+            GatewayRunner,
+            "_resolve_profile_home_for_source",
+            side_effect=ProfileResolutionError("routed profile 'missing' does not exist"),
+        ):
+            asyncio.run(
+                runner._run_background_task(
+                    prompt="test", source=source, task_id="bg_test"
+                )
+            )
+
+        # No agent turn: the inner implementation is never awaited.
+        inner.assert_not_awaited()
+        # The chat gets told directly (fire-and-forget has no other caller).
+        fake_adapter.send.assert_awaited_once()
+        sent_text = fake_adapter.send.call_args.args[1]
+        assert "bg_test" in sent_text
+        assert "administrator" in sent_text or "not configured" in sent_text.lower() or "isn't configured" in sent_text
+
+

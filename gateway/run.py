@@ -1816,6 +1816,24 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class ProfileResolutionError(RuntimeError):
+    """A multiplexed turn's routed profile could not be resolved to a home.
+
+    Distinct from :class:`MultiplexConfigError` (a startup-fatal config
+    problem): this is a per-turn, per-message failure — the routed/explicit
+    profile is missing on disk, or resolution itself raised. Raised by
+    :meth:`GatewayRunner._resolve_profile_home_for_source` only when
+    multiplexing is active, so it can never affect a single-profile gateway.
+
+    Under multiplexing, falling back to the global ``HERMES_HOME`` on a
+    resolution miss would silently serve the turn from the multiplexer's own
+    (root) identity — its config, skills, memory, and secrets — instead of
+    refusing it (agentsmith #94 item 2). Callers must catch this and turn it
+    into a polite "this conversation is not configured" reply with **no
+    agent turn**, never let it fall through to the root home.
+    """
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -17422,12 +17440,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_profile_scoped_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+        try:
+            message_text = await self._prepare_profile_scoped_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
+        except ProfileResolutionError:
+            # Fail closed (agentsmith #94 item 2): the routed profile under
+            # multiplexing is missing or unresolvable — refuse the turn
+            # outright instead of silently falling back to the root identity.
+            # No agent turn happens; this reply is the only thing sent.
+            logger.error(
+                "Refusing turn for %s/%s — routed profile could not be resolved "
+                "under profile multiplexing",
+                source.platform.value, source.chat_id,
+            )
+            return (
+                "Sorry, this conversation isn't configured correctly right now "
+                "(the routed profile is unavailable). Please contact your "
+                "administrator."
+            )
         if message_text is None:
             return
 
@@ -18241,6 +18275,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
+            if isinstance(e, ProfileResolutionError):
+                # Fail closed (agentsmith #94 item 2): raised only under
+                # profile multiplexing, only when the routed profile is
+                # missing/unresolvable. No agent turn ran — this reply is the
+                # only thing sent, and the root identity was never touched.
+                return (
+                    "Sorry, this conversation isn't configured correctly "
+                    "right now (the routed profile is unavailable). Please "
+                    "contact your administrator."
+                )
             return (
                 f"Sorry, I encountered an unexpected error.{status_hint}\n"
                 "Try again or use /reset to start a fresh session."
@@ -19337,7 +19381,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
+        try:
+            profile_home = self._resolve_profile_home_for_source(source)
+        except ProfileResolutionError:
+            # Fail closed (agentsmith #94 item 2): refuse the background task
+            # outright rather than falling back to the root identity. This is
+            # fire-and-forget (asyncio.create_task in slash_commands.py), so
+            # there is no caller to hand a reply to — tell the chat directly,
+            # matching _run_background_task_inner's own failure-notice convention.
+            logger.error(
+                "Refusing background task %s for %s/%s — routed profile could "
+                "not be resolved under profile multiplexing",
+                task_id, source.platform.value, source.chat_id,
+            )
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        f"❌ Background task {task_id} failed: this conversation "
+                        "isn't configured correctly right now (the routed "
+                        "profile is unavailable). Please contact your "
+                        "administrator.",
+                        metadata=self._thread_metadata_for_source(source, event_message_id),
+                    )
+                except Exception:
+                    logger.debug("Failed to notify chat of background task profile failure", exc_info=True)
+            return
+
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
@@ -24080,6 +24151,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           2. ``_profile_name_for_source`` — re-run routing here as a defensive
              fallback for sources that bypass ``build_source``.
           3. The active profile (the multiplexer's own home).
+
+        Under ``gateway.multiplex_profiles``, a missing explicit/routed
+        profile or a resolution failure raises :class:`ProfileResolutionError`
+        instead of falling back to the global ``HERMES_HOME`` — that fallback
+        would silently serve the turn from the multiplexer's own root identity
+        (agentsmith #94 item 2). Non-multiplex gateways are unaffected: they
+        never route by profile, so ``explicit_profile`` is never set there and
+        this method keeps its old fallback-to-global behaviour.
         """
         from hermes_cli.profiles import (
             get_active_profile_name,
@@ -24087,7 +24166,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
-        
+
+        multiplex_active = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
         try:
@@ -24100,10 +24183,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
                 name = get_active_profile_name() or "default"
-            
+
             profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
+            # An explicit profile missing on disk under multiplexing must fail
+            # closed — falling back would serve this turn from the root
+            # identity instead of refusing it.
             if explicit_profile and not profile_exists(name):
+                if multiplex_active:
+                    logger.error(
+                        "Profile %r does not exist for source %s/%s (guild_id=%s); "
+                        "refusing to fall back to the root HERMES_HOME under "
+                        "profile multiplexing",
+                        explicit_profile,
+                        source.platform.value,
+                        source.chat_id,
+                        getattr(source, "guild_id", None),
+                    )
+                    raise ProfileResolutionError(
+                        f"routed profile {explicit_profile!r} does not exist"
+                    )
                 logger.warning(
                     "Profile %r does not exist for source %s/%s (guild_id=%s), "
                     "falling back to global HERMES_HOME",
@@ -24114,8 +24212,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return get_hermes_home()
             return profile_dir
-        except Exception:
+        except ProfileResolutionError:
+            raise
+        except Exception as exc:
             # Catch normalization errors, path errors, etc.
+            if multiplex_active:
+                logger.error(
+                    "Failed to resolve profile directory for source %s/%s "
+                    "(guild_id=%s, profile=%s); refusing to fall back to the "
+                    "root HERMES_HOME under profile multiplexing: %s",
+                    source.platform.value,
+                    source.chat_id,
+                    getattr(source, "guild_id", None),
+                    explicit_profile or "(no profile)",
+                    exc,
+                    exc_info=True,
+                )
+                raise ProfileResolutionError(
+                    "failed to resolve profile directory"
+                ) from exc
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
                 "falling back to global HERMES_HOME: %s",

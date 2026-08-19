@@ -52,6 +52,14 @@ def stream_diag_init() -> Dict[str, Any]:
         "bytes": 0,
         "headers": {},
         "http_status": None,
+        # Progress-aware stale-stream detection (#104): how many accepted
+        # chunks carried real progress (content/reasoning/tool-call delta or
+        # a finish_reason) vs. how many were empty (SSE keep-alive pings,
+        # usage-only chunks). Only populated by the chat_completions
+        # streaming path today — Anthropic/Bedrock have their own
+        # detectors and leave these at 0.
+        "empty_chunks": 0,
+        "progress_chunks": 0,
     }
 
 
@@ -159,6 +167,8 @@ def log_stream_retry(
         _now = time.time()
         _bytes = 0
         _chunks = 0
+        _empty_chunks = 0
+        _progress_chunks = 0
         _elapsed = 0.0
         _ttfb = None
         _headers_repr = "-"
@@ -167,6 +177,8 @@ def log_stream_retry(
             try:
                 _bytes = int(diag.get("bytes") or 0)
                 _chunks = int(diag.get("chunks") or 0)
+                _empty_chunks = int(diag.get("empty_chunks") or 0)
+                _progress_chunks = int(diag.get("progress_chunks") or 0)
                 _started = float(diag.get("started_at") or _now)
                 _elapsed = max(0.0, _now - _started)
                 _first = diag.get("first_chunk_at")
@@ -187,7 +199,8 @@ def log_stream_retry(
             "subagent_id=%s depth=%s provider=%s base_url=%s "
             "error_type=%s error=%s "
             "chain=%s "
-            "http_status=%s bytes=%d chunks=%d elapsed=%.2fs ttfb=%s "
+            "http_status=%s bytes=%d chunks=%d empty_chunks=%d "
+            "progress_chunks=%d elapsed=%.2fs ttfb=%s "
             "upstream=[%s]",
             kind,
             attempt,
@@ -202,6 +215,8 @@ def log_stream_retry(
             _http_status,
             _bytes,
             _chunks,
+            _empty_chunks,
+            _progress_chunks,
             _elapsed,
             f"{_ttfb:.2f}s" if _ttfb is not None else "-",
             _headers_repr,

@@ -21,6 +21,7 @@ when exit==2 AND no usable match payload remains.
 These tests drive the real methods through the real local terminal backend.
 """
 
+import json
 import os
 import shutil
 
@@ -28,10 +29,12 @@ import pytest
 
 from tools.file_operations import (
     ShellFileOperations,
+    _is_valid_regex,
     _pattern_has_regex_newline,
     _split_tool_diagnostics,
 )
 from tools.environments.local import LocalEnvironment
+from tools.file_tools import search_tool
 
 
 def _ops(root):
@@ -83,7 +86,14 @@ class TestSearchErrorGuard:
     def test_hard_error_is_surfaced(self, method, match_tree):
         # An invalid regex makes rg/grep exit 2 with only diagnostics in
         # stdout. The guard MUST surface it — not return empty matches.
-        res = _search(_ops(match_tree), method, "[", match_tree)
+        #
+        # rg's engine additionally rejects some patterns Python's `re`
+        # accepts (e.g. backreferences), so `_search_with_rg` uses one of
+        # those here — the #117 fixed-string fallback only engages for
+        # patterns invalid under Python's `re`, and must not intercept a
+        # genuine rg-only regex error.
+        pattern = r"(a)\1" if method == "_search_with_rg" else "["
+        res = _search(_ops(match_tree), method, pattern, match_tree)
         assert res.error is not None, "search error was silently swallowed"
         assert "Search failed" in res.error
         assert not res.matches
@@ -130,3 +140,78 @@ class TestSplitToolDiagnostics:
         assert diagnostics == ""
         assert "--" in payload
         assert "a.py-6-after" in payload
+
+
+# ---------------------------------------------------------------------------
+# Fixed-string fallback for invalid-regex patterns (#117)
+#
+# `search_files pattern="*One Development*"` used to hard-error with rg's
+# "regex parse error: repetition operator missing expression" (a leading
+# `*` has nothing to repeat) — one wasted round-trip before the caller could
+# retry. `_search_with_rg` now validates the pattern locally with Python's
+# `re` first and, when it doesn't compile, searches it as a literal fixed
+# string (rg --fixed-strings) in the same call instead of erroring.
+# ---------------------------------------------------------------------------
+
+class TestIsValidRegex:
+    """Unit coverage for the local pre-validation helper."""
+
+    def test_leading_glob_star_is_invalid_regex(self):
+        assert not _is_valid_regex("*One Development*")
+
+    def test_unclosed_bracket_is_invalid_regex(self):
+        assert not _is_valid_regex("[")
+
+    def test_ordinary_regex_is_valid(self):
+        assert _is_valid_regex("needle")
+        assert _is_valid_regex(r"O.e Development")
+
+
+@pytest.mark.skipif(not shutil.which("rg"), reason="requires rg (ripgrep)")
+class TestFixedStringFallback:
+    @pytest.fixture
+    def glob_pattern_tree(self, tmp_path):
+        """A tree with a file whose content literally contains asterisks
+        around the phrase, reproducing the exact bench case from #117
+        (e.g. markdown emphasis: '*One Development*')."""
+        (tmp_path / "notes.md").write_text("See *One Development* for details.\n")
+        (tmp_path / "other.md").write_text("Nothing relevant here.\n")
+        return tmp_path
+
+    def test_invalid_regex_falls_back_to_literal_match(self, glob_pattern_tree):
+        res = _ops(glob_pattern_tree)._search_with_rg(
+            "*One Development*", str(glob_pattern_tree), None, 50, 0, "content", 0
+        )
+        assert res.error is None
+        assert res.total_count == 1
+        assert "notes.md" in res.matches[0].path
+        assert "not valid regex" in (res.warning or "")
+
+    def test_invalid_regex_via_search_files_tool(self, glob_pattern_tree):
+        # Full stack through the actual search_files tool entrypoint,
+        # matching the exact call reported in #117.
+        raw = search_tool(pattern="*One Development*", path=str(glob_pattern_tree))
+        result = json.loads(raw)
+        assert "error" not in result
+        assert result["total_count"] == 1
+
+    def test_invalid_regex_with_no_literal_match_is_clean(self, glob_pattern_tree):
+        # No file contains this literal string either — a real regex-invalid
+        # pattern with no fixed-string interpretation should behave
+        # sensibly: a plain zero-result search, not an rg error.
+        res = _ops(glob_pattern_tree)._search_with_rg(
+            "*Two Development*", str(glob_pattern_tree), None, 50, 0, "content", 0
+        )
+        assert res.error is None
+        assert res.total_count == 0
+
+    def test_valid_regex_still_searched_as_regex(self, glob_pattern_tree):
+        # A well-formed regex must keep matching as a regex (no behavior
+        # change for callers who intended regex syntax) — `.` here matches
+        # the 'n' in "One", which a literal fixed-string search would not.
+        res = _ops(glob_pattern_tree)._search_with_rg(
+            r"O.e Development", str(glob_pattern_tree), None, 50, 0, "content", 0
+        )
+        assert res.error is None
+        assert res.total_count == 1
+        assert "not valid regex" not in (res.warning or "")

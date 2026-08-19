@@ -789,6 +789,25 @@ def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     return "literal \"\\n\" is not allowed" in error and "--multiline" in error
 
 
+def _is_valid_regex(pattern: str) -> bool:
+    """Return True when ``pattern`` compiles as a regex.
+
+    ``search_files`` documents ``pattern`` as a regex (see
+    ``SEARCH_FILES_SCHEMA``), but callers routinely pass glob-style
+    wildcards like ``*One Development*`` instead — a leading ``*`` has
+    nothing to repeat, which is invalid regex under both Python's ``re``
+    and rg's Rust regex engine. Checking with Python's cheap, dependency-free
+    ``re.compile`` before ever invoking rg lets a bad pattern be searched as
+    a literal string in the same round-trip instead of failing with rg's
+    "regex parse error" and making the caller retry.
+    """
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
 def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str) -> SearchResult:
     """Attach a newline-regex warning only when search found no usable results."""
     if result.total_count != 0 or not _pattern_has_regex_newline(pattern):
@@ -2523,6 +2542,17 @@ class ShellFileOperations(FileOperations):
         if multiline:
             cmd_parts.append("--multiline")
 
+        # Fixed-string fallback: `pattern` is documented as a regex, but
+        # callers routinely pass glob-style wildcards like "*text*" instead
+        # — invalid regex (a leading `*` has nothing to repeat) that rg
+        # rejects outright with "regex parse error", burning a round-trip.
+        # Validate locally first and go straight to a literal (-F) search
+        # when the pattern won't compile as regex, so the caller's search
+        # still runs instead of erroring.
+        literal_pattern = not _is_valid_regex(pattern)
+        if literal_pattern:
+            cmd_parts.append("--fixed-strings")
+
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
@@ -2576,6 +2606,13 @@ class ShellFileOperations(FileOperations):
             "Pattern contains \\n — multiline mode (-U) was enabled automatically "
             "so the regex can match across line boundaries."
         ) if multiline else None
+        _fs_note = (
+            "Pattern is not valid regex syntax, so it was matched as a literal "
+            "fixed string instead (rg --fixed-strings) rather than erroring. "
+            "`pattern` is a regex, not a glob — wildcards like `*text*` are "
+            "matched literally here; use `.*text.*` for a regex wildcard."
+        ) if literal_pattern else None
+        _note = " ".join(n for n in (_ml_note, _fs_note) if n) or None
         # Parse results based on output mode
         if output_mode == "files_only":
             all_files = [f for f in stdout.strip().split('\n') if f]
@@ -2586,7 +2623,7 @@ class ShellFileOperations(FileOperations):
                 total_count=total,
                 truncated=bool(limit_reason),
                 limit_reason=limit_reason,
-                warning=_ml_note,
+                warning=_note,
             )
         
         elif output_mode == "count":
@@ -2647,7 +2684,7 @@ class ShellFileOperations(FileOperations):
                 total_count=total,
                 truncated=total > offset + limit or bool(limit_reason),
                 limit_reason=limit_reason,
-                warning=_ml_note,
+                warning=_note,
             )
     
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
