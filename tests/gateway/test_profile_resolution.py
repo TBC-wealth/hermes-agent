@@ -76,9 +76,15 @@ class TestMissingProfileWarning:
     """Tests for warning when a profile doesn't exist on disk."""
     
     def test_nonexistent_profile_warning(self, mock_runner, discord_source, caplog):
-        """When source.profile points to a nonexistent profile, log a WARNING."""
+        """When source.profile points to a nonexistent profile, log a WARNING.
+
+        Non-multiplex fallback-to-global path (agentsmith #94 item 2 only
+        changes behaviour when multiplexing is active — see
+        TestFailClosedUnderMultiplex for that path).
+        """
+        mock_runner.config.multiplex_profiles = False
         discord_source.profile = "nonexistent"
-        
+
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
                 mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
@@ -106,9 +112,14 @@ class TestExceptionHandling:
     """Tests for exception handling in profile resolution."""
     
     def test_get_profile_dir_exception_logs_warning(self, mock_runner, discord_source, caplog):
-        """When get_profile_dir raises an exception, log a WARNING with context."""
+        """When get_profile_dir raises an exception, log a WARNING with context.
+
+        Non-multiplex fallback-to-global path (see TestFailClosedUnderMultiplex
+        for the multiplex-active fail-closed behaviour, #94 item 2).
+        """
+        mock_runner.config.multiplex_profiles = False
         discord_source.profile = "bad-profile"
-        
+
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir", side_effect=ValueError("Invalid profile name")):
                 with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
@@ -131,8 +142,9 @@ class TestRoutingConsultation:
     
     def test_routing_consulted_when_source_profile_empty(self, mock_runner, discord_source):
         """_profile_name_for_source should be called when source.profile is empty."""
+        mock_runner.config.multiplex_profiles = False
         discord_source.profile = None
-        
+
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
                 mock_get_dir.return_value = Path("/hermes/profiles/routed")
@@ -256,5 +268,103 @@ class TestMultiplexGate:
         discord_source.profile = None
 
         assert mock_runner._profile_name_for_source(discord_source) is None
+
+
+class TestFailClosedUnderMultiplex:
+    """Under gateway.multiplex_profiles, a missing/unresolvable routed
+    profile must raise ProfileResolutionError instead of falling back to
+    the global HERMES_HOME (agentsmith #94 item 2) — that fallback would
+    silently serve the turn from the multiplexer's own root identity.
+    """
+
+    def test_missing_explicit_profile_raises(self, mock_runner, discord_source, caplog):
+        from gateway.run import ProfileResolutionError
+
+        mock_runner.config.multiplex_profiles = True
+        discord_source.profile = "nonexistent"
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+                mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
+                with patch("hermes_cli.profiles.profile_exists", return_value=False):
+                    with patch(
+                        "hermes_constants.get_hermes_home", return_value=Path("/hermes")
+                    ) as mock_root_home:
+                        with caplog.at_level(logging.ERROR):
+                            with pytest.raises(ProfileResolutionError):
+                                mock_runner._resolve_profile_home_for_source(discord_source)
+                        # The root home must never even be consulted as a
+                        # fallback value under the fail-closed path.
+                        mock_root_home.assert_not_called()
+                        assert any(
+                            r.levelname == "ERROR" and "nonexistent" in r.message
+                            for r in caplog.records
+                        )
+
+    def test_resolution_exception_raises(self, mock_runner, discord_source, caplog):
+        from gateway.run import ProfileResolutionError
+
+        mock_runner.config.multiplex_profiles = True
+        discord_source.profile = "bad-profile"
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            with patch(
+                "hermes_cli.profiles.get_profile_dir",
+                side_effect=ValueError("Invalid profile name"),
+            ):
+                with patch(
+                    "hermes_constants.get_hermes_home", return_value=Path("/hermes")
+                ) as mock_root_home:
+                    with caplog.at_level(logging.ERROR):
+                        with pytest.raises(ProfileResolutionError):
+                            mock_runner._resolve_profile_home_for_source(discord_source)
+                    mock_root_home.assert_not_called()
+
+    def test_routed_missing_profile_raises(self, mock_runner, discord_source):
+        """A routing-matched (not just explicit source.profile) missing
+        profile also fails closed — the guard doesn't only cover the
+        source.profile entry point."""
+        from gateway.run import ProfileResolutionError
+
+        mock_runner.config.multiplex_profiles = True
+        discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value="routed-missing")
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+                mock_get_dir.return_value = Path("/hermes/profiles/routed-missing")
+                with patch("hermes_cli.profiles.profile_exists", return_value=False):
+                    with pytest.raises(ProfileResolutionError):
+                        mock_runner._resolve_profile_home_for_source(discord_source)
+
+    def test_existing_profile_unaffected_by_gate(self, mock_runner, discord_source):
+        """An explicit profile that DOES exist resolves normally even with
+        multiplexing on — the gate only fires on an actual miss/failure."""
+        mock_runner.config.multiplex_profiles = True
+        discord_source.profile = "coder"
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+                mock_get_dir.return_value = Path("/hermes/profiles/coder")
+                with patch("hermes_cli.profiles.profile_exists", return_value=True):
+                    result = mock_runner._resolve_profile_home_for_source(discord_source)
+                    assert result == Path("/hermes/profiles/coder")
+
+    def test_multiplex_off_still_falls_back(self, mock_runner, discord_source):
+        """Sanity check that the fail-closed gate is truly opt-in: with
+        multiplexing off, a missing profile still falls back to global
+        HERMES_HOME exactly as before (no ProfileResolutionError)."""
+        mock_runner.config.multiplex_profiles = False
+        discord_source.profile = "nonexistent"
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+                mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
+                with patch("hermes_cli.profiles.profile_exists", return_value=False):
+                    with patch(
+                        "hermes_constants.get_hermes_home", return_value=Path("/hermes")
+                    ):
+                        result = mock_runner._resolve_profile_home_for_source(discord_source)
+                        assert result == Path("/hermes")
 
 
