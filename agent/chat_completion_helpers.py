@@ -274,6 +274,52 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
     return size
 
 
+def _chunk_has_progress(chunk: Any) -> bool:
+    """True if a Chat Completions SSE chunk carries real progress.
+
+    "Progress" means the user or the agent loop can observe something new:
+    non-empty text content, reasoning content, a tool-call delta (name or
+    arguments), or a ``finish_reason``.  Everything else — usage-only
+    chunks, chunks with no choices, or a delta with every field empty — is
+    an SSE keep-alive / bookkeeping chunk.
+
+    Used to gate the stale-stream timer reset (#104): before this, ANY
+    chunk — including provider keep-alive pings carrying no content —
+    reset ``last_chunk_time``, so a provider that pinged every few minutes
+    while otherwise silent could stall a turn for 1000+ seconds without
+    ever tripping the stale-stream detector.
+
+    Fails open (returns True) on any inspection error — a bug in this
+    detector must never cause a healthy stream to be mis-timed into a
+    false stale-kill.
+    """
+    try:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            return False
+        choice0 = choices[0]
+        if getattr(choice0, "finish_reason", None):
+            return True
+        delta = getattr(choice0, "delta", None)
+        if delta is None:
+            return False
+        if getattr(delta, "content", None):
+            return True
+        if getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None):
+            return True
+        tool_calls = getattr(delta, "tool_calls", None)
+        if tool_calls:
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                if fn is not None and (
+                    getattr(fn, "name", None) or getattr(fn, "arguments", None)
+                ):
+                    return True
+        return False
+    except Exception:
+        return True
+
+
 def _codex_wait_notice_recovery(
     *,
     stale_timeout: float,
@@ -2477,7 +2523,10 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent, api_kwargs: dict, *, on_first_delta=None,
+    _retry_after_partial_attempted: bool = False,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2492,6 +2541,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
+
+    ``_retry_after_partial_attempted`` is a private recursion guard (#104):
+    when ``HERMES_STREAM_RETRY_AFTER_PARTIAL=1`` and every in-loop retry
+    attempt is exhausted with a dropped tool call still pending, this
+    function calls itself ONCE more from scratch instead of returning the
+    "dropped tool call" partial-stream stub — never callable code, only
+    this module.  Never set it from outside.
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
@@ -3069,11 +3125,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the fact that a tool call was in flight so retry policy does not
             # misclassify the attempt as a partial text response. The chunk
             # itself is still rejected below and never reaches callbacks.
+            _has_progress = True
             try:
                 choices = getattr(_chunk, "choices", None)
                 delta = getattr(choices[0], "delta", None) if choices else None
                 if getattr(delta, "tool_calls", None):
                     provider_tool_in_flight["yes"] = True
+                _has_progress = _chunk_has_progress(_chunk)
             except Exception:
                 pass
             if not _stream_attempt_is_active(stream_attempt_id):
@@ -3087,11 +3145,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     api_kwargs.get("model", "unknown"),
                 )
                 return False
-            # Record provider activity before Relay processes the chunk. This
-            # prevents the stale watchdog from cancelling a live stream while
-            # an interceptor or codec is still handling an already-received
-            # event.
-            last_chunk_time["t"] = time.time()
+            # Record provider activity before Relay processes the chunk — but
+            # ONLY when the chunk carries real progress (#104).  This is the
+            # sole point that resets ``last_chunk_time`` for this stream (the
+            # chunk-consumption loop below no longer does), so an empty
+            # keep-alive chunk no longer extends the stale-stream window
+            # indefinitely; only content/reasoning/tool-call deltas and a
+            # terminal finish_reason do.
+            if _has_progress:
+                last_chunk_time["t"] = time.time()
+                _diag["progress_chunks"] = int(_diag.get("progress_chunks", 0)) + 1
+            else:
+                _diag["empty_chunks"] = int(_diag.get("empty_chunks", 0)) + 1
             return True
 
         def _relay_final_response() -> dict[str, Any]:
@@ -3144,16 +3209,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # ownership of closing the underlying provider stream.
             _set_request_stream_handle(stream)
         for chunk in stream:
-            last_chunk_time["t"] = time.time()
+            _now = time.time()
             agent._touch_activity("receiving stream response")
 
+            # ``last_chunk_time`` is intentionally NOT reset here anymore —
+            # ``_accept_stream_chunk`` above is the sole reset point, and it
+            # only resets on chunks that carry real progress (#104).  This
+            # loop still counts every accepted chunk (progress or not) for
+            # the diagnostic totals below.
+            #
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
             # interrupted by diagnostic accounting.
             try:
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
-                    _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _diag["first_chunk_at"] = _now
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -3776,10 +3847,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             or _is_sse_conn_err_preview
                             or _is_stream_parse_err
                         )
+                        # HERMES_STREAM_RETRY_AFTER_PARTIAL=1 (#104): opts a
+                        # surface that never shows the user interim streamed
+                        # text (agentsmith's Teams unit) into silently
+                        # retrying ANY transient partial-delivery drop, not
+                        # just the tool-call-in-flight case above — discarding
+                        # the partial text/tool state and starting the next
+                        # attempt fresh.  Still requires a transient error and
+                        # remaining retry budget: a permanent error (content
+                        # filter, auth, bad request) must still fall through
+                        # to the stub/raise path below, and a flag-enabled
+                        # unit still respects HERMES_STREAM_RETRIES.
+                        _retry_after_partial_flag = (
+                            os.environ.get("HERMES_STREAM_RETRY_AFTER_PARTIAL") == "1"
+                        )
                         _can_silent_retry = (
-                            _partial_tool_in_flight
-                            and _is_transient
+                            _is_transient
                             and _stream_attempt < _max_stream_retries
+                            and (_partial_tool_in_flight or _retry_after_partial_flag)
                         )
                         if not _can_silent_retry:
                             # Either no tool call was in-flight (so the
@@ -3793,18 +3878,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             )
                             result["error"] = e
                             return
-                        # Tool call was in-flight AND error is transient:
-                        # retry silently.  Clear per-attempt state so the
-                        # next stream starts clean.  Fire a "reconnecting"
-                        # marker so the user sees why the preamble is
-                        # about to be re-streamed.  Structured WARNING is
-                        # emitted by ``_emit_stream_drop`` below; no
-                        # additional INFO line needed.
+                        # Tool call was in-flight AND error is transient (OR
+                        # the retry-after-partial flag opted this surface
+                        # into retrying regardless): retry silently.  Clear
+                        # per-attempt state so the next stream starts clean.
+                        # Fire a "reconnecting" marker so a surface that DOES
+                        # show interim text sees why the preamble is about to
+                        # be re-streamed.  Structured WARNING is emitted by
+                        # ``_emit_stream_drop`` below; no additional INFO
+                        # line needed.
                         try:
-                            agent._fire_stream_delta(
-                                "\n\n⚠ Connection dropped mid tool-call; "
-                                "reconnecting…\n\n"
-                            )
+                            if _partial_tool_in_flight:
+                                agent._fire_stream_delta(
+                                    "\n\n⚠ Connection dropped mid tool-call; "
+                                    "reconnecting…\n\n"
+                                )
+                            else:
+                                agent._fire_stream_delta(
+                                    "\n\n⚠ Connection dropped mid-response; "
+                                    "reconnecting…\n\n"
+                                )
                         except Exception:
                             pass
                         # Reset the streamed-text buffer so the retry's
@@ -3817,7 +3910,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             pass
                         # Reset in-memory accumulators so the next
                         # attempt's chunks don't concat onto the dead
-                        # stream's partial JSON.
+                        # stream's partial JSON.  ``content_parts`` /
+                        # ``tool_calls_acc`` / ``reasoning_parts`` need no
+                        # explicit reset here — ``continue`` below starts the
+                        # NEXT iteration of the ``for _stream_attempt in
+                        # range(...)`` loop, which calls
+                        # ``_call_chat_completions`` again as a fresh
+                        # function invocation with fresh empty locals. The
+                        # messages list (``api_kwargs``) is untouched by this
+                        # branch, so the retried attempt sends the exact same
+                        # request.
                         result["partial_tool_names"] = []
                         deltas_were_sent["yes"] = False
                         first_delta_fired["done"] = False
@@ -3825,7 +3927,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             error=e,
                             attempt=_stream_attempt + 2,
                             max_attempts=_max_stream_retries + 1,
-                            mid_tool_call=True,
+                            mid_tool_call=_partial_tool_in_flight,
                             diag=request_client_holder.get("diag"),
                         )
                         _cancel_current_stream_attempt("stream_mid_tool_retry_cleanup")
@@ -4067,6 +4169,40 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # Total wall-clock ceiling per attempt (#104), independent of chunk
+    # progress: a provider can keep resetting the stale-stream timer with
+    # genuine (but runaway) reasoning/content deltas forever.  0 (default)
+    # disables the ceiling entirely — only an explicit env var opts a unit
+    # in (the agentsmith service unit sets 900).
+    _stream_max_seconds = env_float("HERMES_STREAM_MAX_SECONDS", 0.0)
+    # Mirrors ``_max_stream_retries`` inside ``_call()`` (not visible from
+    # this outer poll-loop scope) — used only to label the diagnostic log
+    # line below with an attempt/max_attempts pair consistent with the
+    # drop-path logging.
+    _diag_max_attempts = env_int("HERMES_STREAM_RETRIES", 2) + 1
+
+    def _log_diag_kill(kind: str, elapsed: float, message: str) -> None:
+        """Emit the same structured stream_diag WARNING that drops get, for
+        a kill/abort this poll loop initiated itself (stale kill, ceiling
+        kill, interrupt) rather than an exception from the provider.  Lets
+        post-hoc log analysis tell "no chunks at all" (stale) apart from
+        "chunks kept coming but never finished" (ceiling) and from a
+        user-initiated /stop (interrupt) — see #104.
+        """
+        try:
+            with stream_attempt_lock:
+                _attempt_no = int(stream_attempt_state.get("current") or 0)
+            agent._log_stream_retry(
+                kind=kind,
+                error=RuntimeError(message),
+                attempt=_attempt_no,
+                max_attempts=_diag_max_attempts,
+                mid_tool_call=bool(provider_tool_in_flight.get("yes")),
+                diag=request_client_holder.get("diag"),
+            )
+        except Exception:
+            logger.debug("stream diag kill-event log failed", exc_info=True)
+
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -4167,6 +4303,59 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
             )
+            _log_diag_kill(
+                "stale_kill", _stale_elapsed,
+                f"stream stale for {int(_stale_elapsed)}s (threshold "
+                f"{int(_stream_stale_timeout)}s)",
+            )
+        elif _stream_max_seconds > 0:
+            # Total wall-clock ceiling per attempt (#104): the stale-stream
+            # timer resets on every progress-bearing chunk, so a stream that
+            # keeps producing real (if runaway) content/reasoning forever
+            # never trips the stale detector above.  This is a hard backstop
+            # independent of progress — killed exactly like a stale stream
+            # (same cancel/close/streak/retry path) once an attempt has run
+            # longer than ``HERMES_STREAM_MAX_SECONDS`` in total, regardless
+            # of how recently the last chunk arrived.
+            _attempt_diag = request_client_holder.get("diag")
+            _attempt_started = (
+                _attempt_diag.get("started_at")
+                if isinstance(_attempt_diag, dict) else None
+            )
+            if _attempt_started is not None:
+                _ceiling_elapsed = time.time() - float(_attempt_started)
+                if _ceiling_elapsed > _stream_max_seconds:
+                    logger.warning(
+                        "Stream exceeded %.0fs wall-clock ceiling "
+                        "(HERMES_STREAM_MAX_SECONDS) — killing connection. "
+                        "model=%s.",
+                        _stream_max_seconds, api_kwargs.get("model", "unknown"),
+                    )
+                    agent._buffer_status(
+                        f"⚠️ stream exceeded {int(_stream_max_seconds)}s — "
+                        f"reconnecting..."
+                    )
+                    try:
+                        _cancel_current_stream_attempt("stream_max_seconds_kill")
+                        _close_request_client_once("stream_max_seconds_kill")
+                    except Exception:
+                        pass
+                    # Same circuit-breaker accounting as a stale kill — the
+                    # attempt still failed to finish, just for a different
+                    # reason (ran too long instead of ran silent).
+                    _bump_stale_streak(agent)
+                    last_chunk_time["t"] = time.time()
+                    agent._emit_wait_notice(
+                        f"⚠ stream exceeded {int(_stream_max_seconds)}s — "
+                        f"reconnecting..."
+                    )
+                    agent._touch_activity(
+                        f"stream exceeded {int(_stream_max_seconds)}s, reconnecting"
+                    )
+                    _log_diag_kill(
+                        "ceiling_kill", _ceiling_elapsed,
+                        f"stream exceeded {int(_stream_max_seconds)}s",
+                    )
 
         if agent._interrupt_requested:
             # Mark THIS request cancelled before force-closing so the worker's
@@ -4186,6 +4375,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _close_request_client_once("stream_interrupt_abort")
             except Exception:
                 pass
+            _log_diag_kill(
+                "stream_interrupt_abort", time.time() - last_chunk_time["t"],
+                "stream interrupted by user (/stop)",
+            )
             raise InterruptedError("Agent interrupted during streaming API call")
     # Worker thread exited before the main thread's poll loop could check
     # the interrupt flag.  If the worker returned early due to an interrupt
@@ -4208,6 +4401,35 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Append a user-visible warning if tool calls were dropped so
             # the user and model both know what was attempted.
             _partial_names = list(result.get("partial_tool_names") or [])
+            if (
+                _partial_names
+                and os.environ.get("HERMES_STREAM_RETRY_AFTER_PARTIAL") == "1"
+                and not _retry_after_partial_attempted
+            ):
+                # #104: every in-loop retry attempt is exhausted (or the
+                # in-loop path never fired — e.g. it was a stale/ceiling
+                # kill's resulting transport error, which IS transient but
+                # may have already burned the whole HERMES_STREAM_RETRIES
+                # budget across attempts) and we're about to drop a tool
+                # call permanently.  On a surface that never rendered the
+                # partial text to the user (Teams), a full fresh attempt is
+                # strictly better than surfacing a dropped-tool-call warning
+                # and asking the user to retry manually.  Bounded to exactly
+                # one extra attempt via the recursion guard — this does not
+                # loop forever even against a permanently wedged provider.
+                # ``api_kwargs`` (the messages list) is unchanged, so the
+                # retried call is byte-identical to the one that just failed.
+                logger.warning(
+                    "Partial stream dropped tool call(s) %s after %s chars "
+                    "of text; HERMES_STREAM_RETRY_AFTER_PARTIAL=1 — "
+                    "discarding partial text and retrying fresh instead of "
+                    "surfacing a dropped-tool-call warning: %s",
+                    _partial_names, len(_partial_text or ""), result["error"],
+                )
+                return interruptible_streaming_api_call(
+                    agent, api_kwargs, on_first_delta=on_first_delta,
+                    _retry_after_partial_attempted=True,
+                )
             if _partial_names:
                 _name_str = ", ".join(_partial_names[:3])
                 if len(_partial_names) > 3:
