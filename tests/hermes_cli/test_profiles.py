@@ -816,4 +816,184 @@ class TestProfilesToServe:
         assert serve["coder"] == get_profile_dir("coder")
 
 
+# ===================================================================
+# Dashboard multiplex reporting (agentsmith #94 item 4)
+# ===================================================================
+
+class TestMultiplexGatewayRunningRedirect:
+    """Under gateway.multiplex_profiles, served profiles never run their own
+    gateway process — _check_gateway_running must report the root home's
+    liveness for them instead of a bare "stopped"."""
+
+    def _write_live_runtime_state(self, home, gw_status):
+        live_pid = os.getpid()
+        (home / "gateway_state.json").write_text(
+            json.dumps(
+                {
+                    "pid": live_pid,
+                    "kind": "hermes-gateway",
+                    "argv": ["hermes", "gateway", "run"],
+                    "start_time": gw_status._get_process_start_time(live_pid),
+                    "gateway_state": "running",
+                    "active_agents": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_served_profile_reports_root_liveness(self, profile_env, monkeypatch):
+        import gateway.status as gw_status
+        from hermes_cli.profiles import _check_gateway_running
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        served = create_profile("coder", no_alias=True)
+
+        # Root has a live gateway; the served profile has no gateway.pid /
+        # gateway_state.json of its own (the multiplexer serves it).
+        self._write_live_runtime_state(default_home, gw_status)
+
+        fake_config = types.SimpleNamespace(multiplex_profiles=True)
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_config)
+
+        with patch("gateway.status.get_running_pid", return_value=None), patch(
+            "gateway.status._read_process_cmdline",
+            return_value="hermes gateway run --replace",
+        ):
+            assert _check_gateway_running(served) is True
+
+    def test_non_served_dir_not_redirected(self, profile_env, monkeypatch):
+        from hermes_cli.profiles import _check_gateway_running
+        import gateway.status as gw_status
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        self._write_live_runtime_state(default_home, gw_status)
+
+        fake_config = types.SimpleNamespace(multiplex_profiles=True)
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_config)
+
+        orphan = tmp_path / "not_a_served_profile"
+        orphan.mkdir()
+
+        with patch("gateway.status.get_running_pid", return_value=None):
+            assert _check_gateway_running(orphan) is False
+
+    def test_multiplex_off_no_redirect(self, profile_env, monkeypatch):
+        from hermes_cli.profiles import _check_gateway_running
+        import gateway.status as gw_status
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        served = create_profile("coder", no_alias=True)
+        self._write_live_runtime_state(default_home, gw_status)
+
+        fake_config = types.SimpleNamespace(multiplex_profiles=False)
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_config)
+
+        with patch("gateway.status.get_running_pid", return_value=None):
+            assert _check_gateway_running(served) is False
+
+    def test_root_itself_not_recursively_redirected(self, profile_env, monkeypatch):
+        """The root/default home is itself in profiles_to_serve()'s served
+        set. It must resolve its OWN liveness, never loop back into the
+        redirect (which would recurse forever without the reentry guard)."""
+        from hermes_cli.profiles import _check_gateway_running
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+
+        fake_config = types.SimpleNamespace(multiplex_profiles=True)
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_config)
+
+        with patch("gateway.status.get_running_pid", return_value=None):
+            assert _check_gateway_running(default_home) is False
+
+
+class TestCountSkillsExternalDirs:
+    """_count_skills must include skills.external_dirs (agentsmith #94 item 4).
+
+    Standard (non-default) profiles keep their local skills/ empty by design;
+    skills are provided via skills.external_dirs, so counting only the local
+    dir under-reports (dashboard shows "Skills: 0").
+    """
+
+    def _write_skill(self, skill_dir: Path, name: str):
+        d = skill_dir / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(f"# {name}\n")
+
+    def test_counts_external_dirs_alongside_empty_local(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+
+        tmp_path = profile_env
+        profile_dir = create_profile("writer", no_alias=True, no_skills=True)
+        (profile_dir / "skills").mkdir(parents=True, exist_ok=True)
+
+        catalog = tmp_path / "shared-catalog"
+        for i in range(3):
+            self._write_skill(catalog, f"skill-{i}")
+
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"external_dirs": [str(catalog)]}})
+        )
+
+        assert _count_skills(profile_dir) == 3
+
+    def test_local_and_external_both_counted(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+
+        tmp_path = profile_env
+        profile_dir = create_profile("writer2", no_alias=True, no_skills=True)
+        local_skills = profile_dir / "skills"
+        local_skills.mkdir(parents=True, exist_ok=True)
+        self._write_skill(local_skills, "local-one")
+
+        catalog = tmp_path / "shared-catalog2"
+        self._write_skill(catalog, "ext-one")
+        self._write_skill(catalog, "ext-two")
+
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"external_dirs": [str(catalog)]}})
+        )
+
+        assert _count_skills(profile_dir) == 3
+
+    def test_no_external_dirs_configured_unchanged(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+
+        profile_dir = create_profile("plain", no_alias=True, no_skills=True)
+        local_skills = profile_dir / "skills"
+        local_skills.mkdir(parents=True, exist_ok=True)
+        self._write_skill(local_skills, "only-one")
+
+        assert _count_skills(profile_dir) == 1
+
+    def test_symlinked_subdir_not_followed(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+
+        tmp_path = profile_env
+        profile_dir = create_profile("linktest", no_alias=True, no_skills=True)
+        (profile_dir / "skills").mkdir(parents=True, exist_ok=True)
+
+        catalog = tmp_path / "catalog3"
+        self._write_skill(catalog, "in-catalog")
+
+        outside = tmp_path / "outside-catalog"
+        self._write_skill(outside, "should-not-count")
+
+        try:
+            (catalog / "linked").symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported in this environment")
+
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"external_dirs": [str(catalog)]}})
+        )
+
+        # Only the one real skill inside catalog/ counts; the symlinked
+        # subdir pointing outside catalog/ must not be descended into.
+        assert _count_skills(profile_dir) == 1
+
+
 
