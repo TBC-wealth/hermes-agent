@@ -5395,39 +5395,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+    def get_session_by_title(self, title: str, user_id: str = None) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None.
+
+        Pass ``user_id`` to restrict the lookup to one gateway user's
+        sessions (``sessions.user_id``).
+        """
+        where = "s.title = ?"
+        params: list = [title]
+        if user_id:
+            where += " AND s.user_id = ?"
+            params.append(user_id)
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT s.*, "
                 "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
                 "FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.title = ?",
-                (title,),
+                f"WHERE {where}",
+                params,
             )
             row = cursor.fetchone()
         return self._session_row_dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(self, title: str, user_id: str = None) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
         If not, searches for "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
         latest numbered variant (the most recent continuation).
+
+        Pass ``user_id`` to restrict the search to one gateway user's
+        sessions (``sessions.user_id``) — used by the multiplexed gateway's
+        root-store Teams title lookup so a requester only ever resolves
+        their own sessions by title.
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, user_id=user_id)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = "title LIKE ? ESCAPE '\\'"
+        params: list = [f"{escaped} #%"]
+        if user_id:
+            where += " AND user_id = ?"
+            params.append(user_id)
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"WHERE {where} ORDER BY started_at DESC",
+                params,
             )
             numbered = cursor.fetchall()
 
@@ -5563,6 +5582,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compact_rows: bool = False,
         include_pinned: bool = False,
         session_key: str = None,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -5615,6 +5635,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
         configured per-user isolation policy).
+
+        Pass ``user_id`` to restrict results to sessions owned by that
+        gateway user (``sessions.user_id`` — the AAD/platform id recorded by
+        ``record_gateway_session_peer``). Used by the multiplexed gateway's
+        root-store Teams browse so a requester only ever sees their own
+        sessions.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -5648,6 +5674,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if session_key:
             where_clauses.append("s.session_key = ?")
             params.append(session_key)
+        if user_id:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -7452,6 +7481,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         limit: int = 20,
         offset: int = 0,
         workspace_key: str = None,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
@@ -7463,6 +7493,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         :func:`workspace_key` semantics (git repo root, else cwd). Used by
         ``hermes -c``/``--resume`` so the "last" session is the last one in
         the *current* workspace, not the global MRU.
+
+        Pass ``user_id`` to restrict rows to one gateway user's sessions
+        (``sessions.user_id``).
         """
         select_with_last_active = (
             "SELECT s.*, "
@@ -7480,6 +7513,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ws_clause, ws_params = _workspace_key_clause(workspace_key)
             where_clauses.append(ws_clause)
             params.extend(ws_params)
+        if user_id:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         params.extend([limit, offset])
         with self._lock:

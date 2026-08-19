@@ -295,6 +295,67 @@ def _shape_message(
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
+def _root_store_context():
+    """Return ``(root_db, user_id)`` for a multiplex-routed Teams turn, or ``None``.
+
+    Under ``gateway.multiplex_profiles``, a routed Teams turn's ``HERMES_HOME``
+    is context-overridden to the routed profile's home (see
+    ``hermes_constants.set_hermes_home_override``), so that profile's own
+    ``state.db`` holds only cli/cron sessions — Teams conversations persist in
+    the gateway's **root** store instead (the process env ``HERMES_HOME``,
+    ``sessions.source='teams'``, keyed by ``sessions.user_id`` = the AAD id).
+    Without this, "recover the plan we were working on" can't see the user's
+    own Teams history (#78).
+
+    Returns ``None`` (never raises) whenever any precondition isn't met: no
+    multiplexing, not a Teams turn, no known requester id, the per-turn home
+    isn't actually overridden away from the root (single-profile deployment —
+    nothing to merge, and merging would just duplicate every result), or the
+    root store doesn't exist / can't be opened.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return None
+
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "teams":
+            return None
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "")
+        if not user_id:
+            return None
+
+        import os
+        from pathlib import Path
+
+        root_home = os.environ.get("HERMES_HOME", "").strip()
+        if not root_home:
+            return None
+        root_home_path = Path(root_home)
+
+        import hermes_constants
+
+        override = hermes_constants.get_hermes_home_override()
+        if not override or Path(override).resolve() == root_home_path.resolve():
+            # No per-turn override away from root, or it resolves to the same
+            # place — the caller's default db already IS the root store.
+            return None
+
+        root_db_path = root_home_path / "state.db"
+        if not root_db_path.exists():
+            return None
+
+        from hermes_state import SessionDB
+
+        root_db = SessionDB(db_path=root_db_path, read_only=True)
+        return (root_db, str(user_id))
+    except Exception:
+        logging.debug("root store context unavailable for session_search", exc_info=True)
+        return None
+
+
 def _resolve_profile_db(profile: str):
     """Open another profile's ``state.db`` read-only, or None for the current one.
 
@@ -384,19 +445,41 @@ def _locate_session_db(session_id: str):
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str = None) -> str:
+def _read_session(
+    db,
+    session_id: str,
+    head: int = 20,
+    tail: int = 10,
+    link_profile: str = None,
+    root_ctx=None,
+) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
     the agent wants the transcript. Bounded payload: small sessions return in
     full, large ones return the first ``head`` and last ``tail`` messages with a
     pointer to scroll the middle.
+
+    ``root_ctx``, when given as ``(root_db, user_id)`` (see
+    ``_root_store_context``), is tried when the session isn't found in *db* —
+    but only surfaced if the root session's own ``user_id`` matches, so a
+    routed Teams turn can never read another user's session by id.
     """
     try:
         meta = db.get_session(session_id) or {}
     except Exception as e:
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         meta = {}
+    if not meta and root_ctx is not None:
+        root_db, root_user_id = root_ctx
+        try:
+            root_meta = root_db.get_session(session_id) or {}
+        except Exception as e:
+            logging.debug("root get_session failed for %s: %s", session_id, e, exc_info=True)
+            root_meta = {}
+        if root_meta and str(root_meta.get("user_id") or "") == str(root_user_id):
+            db = root_db
+            meta = root_meta
     if not meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
@@ -434,8 +517,20 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    link_profile: str = None,
+    root_ctx=None,
+) -> str:
+    """Return metadata for the most recent sessions (no LLM calls, no FTS5).
+
+    ``root_ctx``, when given as ``(root_db, user_id)`` (see
+    ``_root_store_context``), adds the requester's own root-store Teams
+    sessions to the listing, ahead of the profile's own sessions — those are
+    the user's own conversations, so they surface first.
+    """
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
@@ -443,8 +538,23 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             order_by_last_active=True,
         )  # fetch extra so we can skip current
 
+        if root_ctx is not None:
+            root_db, root_user_id = root_ctx
+            try:
+                root_sessions = root_db.list_sessions_rich(
+                    limit=limit + 5,
+                    exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                    order_by_last_active=True,
+                    user_id=root_user_id,
+                )
+            except Exception:
+                logging.debug("root list_sessions_rich failed", exc_info=True)
+                root_sessions = []
+            sessions = root_sessions + sessions
+
         current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
 
+        seen_ids: set = set()
         results = []
         for s in sessions:
             sid = s.get("id", "")
@@ -453,6 +563,9 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
                 continue
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
             results.append({
                 "session_id": sid,
                 "link": _session_link(sid, link_profile),
@@ -484,12 +597,18 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    root_ctx=None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
     No FTS5, no bookends — just the slice. The discovery shape's lineage
     fixup is preserved: if the anchor doesn't live in the named session
     but does live in a child session in the same lineage, rebind silently.
+
+    ``root_ctx``, when given as ``(root_db, user_id)`` (see
+    ``_root_store_context``), is tried when *session_id* isn't found in
+    *db* — but only surfaced if the root session's own ``user_id`` matches,
+    so a routed Teams turn can never scroll into another user's session.
     """
     if not isinstance(session_id, str) or not session_id.strip():
         return tool_error("scroll requires session_id", success=False)
@@ -507,6 +626,24 @@ def _scroll(
         except (TypeError, ValueError):
             window = 5
     window = max(1, min(window, 20))
+
+    # Root-store fallback: if the named session doesn't exist in the profile
+    # db, and this is a multiplex-routed Teams turn, try the root store — but
+    # only adopt it when the session's own user_id matches the requester, so
+    # this can never be used to scroll into another user's session.
+    if root_ctx is not None:
+        try:
+            found_in_profile = bool(db.get_session(session_id))
+        except Exception:
+            found_in_profile = False
+        if not found_in_profile:
+            root_db, root_user_id = root_ctx
+            try:
+                root_meta = root_db.get_session(session_id) or {}
+            except Exception:
+                root_meta = {}
+            if root_meta and str(root_meta.get("user_id") or "") == str(root_user_id):
+                db = root_db
 
     # Locate the anchor before applying the current-lineage guard. Discovery
     # intentionally surfaces two kinds of same-lineage history that are no
@@ -624,14 +761,19 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    user_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return a discovery-shaped result when the query matches a session title."""
+    """Return a discovery-shaped result when the query matches a session title.
+
+    Pass ``user_id`` when *db* is a shared/root store so the title lookup is
+    scoped to one requester's own sessions (see ``_root_store_context``).
+    """
     title_query = _normalize_title_query(query)
     if not title_query:
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        session_id = db.resolve_session_by_title(title_query, user_id=user_id)
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
@@ -695,11 +837,25 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
     link_profile: str = None,
+    root_ctx=None,
 ) -> str:
-    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call.
+
+    ``root_ctx``, when given as ``(root_db, user_id)`` (see
+    ``_root_store_context``), merges in a search of the requester's own
+    root-store Teams sessions, ahead of the profile's own results — those
+    are the user's own conversations. Every root-sourced row is tagged with
+    its origin db so lineage/hydration below always queries the db a hit
+    actually lives in, never the profile db.
+    """
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
+    if title_result is None and root_ctx is not None:
+        root_db, root_user_id = root_ctx
+        title_result = _title_match_result(
+            root_db, query, current_lineage_root, user_id=root_user_id
+        )
 
     try:
         raw_results = db.search_messages(
@@ -716,6 +872,32 @@ def _discover(
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
+
+    for r in raw_results:
+        r["_src_db"] = db
+
+    if root_ctx is not None:
+        root_db, root_user_id = root_ctx
+        try:
+            root_raw_results = root_db.search_messages(
+                query=query,
+                role_filter=role_list,
+                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                limit=_DISCOVER_SCAN_LIMIT,
+                offset=0,
+                sort=sort,
+                fields=_DISCOVER_SEARCH_FIELDS,
+                user_id_filter=[root_user_id],
+            )
+        except Exception:
+            logging.error("root FTS5 search failed", exc_info=True)
+            root_raw_results = []
+        for r in root_raw_results:
+            r["_src_db"] = root_db
+        # Root results (the user's own Teams sessions) come first — Python's
+        # sort below is stable, so within each demotion class they keep this
+        # lead over the profile's own results.
+        raw_results = root_raw_results + raw_results
 
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
@@ -751,7 +933,8 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid, _ = _resolve_to_parent(db, raw_sid)
+        row_db = r.get("_src_db", db)
+        resolved_sid, _ = _resolve_to_parent(row_db, raw_sid)
         # Skip the current session lineage — UNLESS the content has been
         # compression-summarised out of the live context (memory black hole
         # after compression). Two sub-cases:
@@ -767,8 +950,8 @@ def _discover(
         # current session, but the matched message row is an archived
         # (active=0, compacted=1) row. The live-context load filters active=1,
         # so that content is no longer in context — let it through.
-        is_compacted_hit = _is_compacted_message(db, r.get("id"))
-        is_ended_session = _is_compression_ended(db, raw_sid)
+        is_compacted_hit = _is_compacted_message(row_db, r.get("id"))
+        is_ended_session = _is_compression_ended(row_db, raw_sid)
         if current_lineage_root and resolved_sid == current_lineage_root:
             if not (is_ended_session or is_compacted_hit):
                 continue
@@ -788,16 +971,17 @@ def _discover(
     for lineage_root, match_info in seen_sessions.items():
         if match_info.get("_title_only"):
             continue
+        hit_db = match_info.get("_src_db", db)
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = hit_db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
 
         try:
-            session_meta = db.get_session(lineage_root) or {}
+            session_meta = hit_db.get_session(lineage_root) or {}
         except Exception:
             session_meta = {}
 
@@ -892,9 +1076,44 @@ def session_search(
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
 
+    # Security: under profile multiplexing, `profile=` must never let a
+    # caller open ANOTHER profile's state.db read-only — that would be a
+    # cross-user read of someone else's cron/briefing sessions (#78). Only
+    # a request for the caller's own current profile is allowed; anything
+    # else is refused outright. Non-multiplex deployments are unaffected —
+    # named profiles reading each other read-only is the documented,
+    # intentional behaviour there.
+    if profile is not None and str(profile).strip():
+        try:
+            from agent.secret_scope import is_multiplex_active
+        except Exception:
+            is_multiplex_active = None  # type: ignore[assignment]
+        if is_multiplex_active is not None and is_multiplex_active():
+            requested_norm = None
+            current_norm = None
+            try:
+                from hermes_cli.profiles import normalize_profile_name
+                from gateway.session_context import get_session_env
+
+                requested_norm = normalize_profile_name(profile)
+                current_raw = get_session_env("HERMES_SESSION_PROFILE", "")
+                if current_raw:
+                    current_norm = normalize_profile_name(current_raw)
+            except Exception:
+                logging.debug(
+                    "profile normalisation failed while checking multiplex guard",
+                    exc_info=True,
+                )
+            if requested_norm is None or requested_norm != current_norm:
+                return tool_error(
+                    "cross-profile session reads are disabled under profile multiplexing",
+                    success=False,
+                )
+
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
+    root_ctx = None
     if profile is not None and str(profile).strip():
         try:
             profile_db = _resolve_profile_db(profile)
@@ -903,6 +1122,12 @@ def session_search(
         if profile_db is not None:
             db = profile_db
             current_session_id = None
+    else:
+        # No explicit cross-profile read requested. Under multiplex this may
+        # be a routed Teams turn whose profile home only ever holds cli/cron
+        # sessions — merge in the requester's own Teams history from the
+        # gateway root store (#78). No-op (returns None) everywhere else.
+        root_ctx = _root_store_context()
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -912,13 +1137,29 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            root_ctx=root_ctx,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid, link_profile=profile)
+        result = _read_session(db, sid, link_profile=profile, root_ctx=root_ctx)
         if json.loads(result).get("success"):
+            return result
+
+        # Under profile multiplexing, scanning every profile for a bare id is
+        # exactly the kind of unscoped lateral session access the profile=
+        # guard above closes (#78) — a multiplexed process's profiles belong
+        # to different users, so a miss must stay a miss instead of a scan
+        # that can hand back someone else's session. The root-store merge
+        # above (root_ctx) already covers the "own Teams history" case this
+        # scan exists for.
+        try:
+            from agent.secret_scope import is_multiplex_active as _mux_active_for_scan
+            _scan_disabled = _mux_active_for_scan()
+        except Exception:
+            _scan_disabled = False
+        if _scan_disabled:
             return result
 
         # Miss in the target profile — the model may have dropped the owning
@@ -945,7 +1186,9 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(
+            db, limit, current_session_id, link_profile=profile, root_ctx=root_ctx
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -967,6 +1210,7 @@ def session_search(
         sort=sort_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        root_ctx=root_ctx,
     )
 
 

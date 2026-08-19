@@ -1237,6 +1237,7 @@ class SessionSearchMixin:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        user_id_filter: List[str] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Run a search against a substring-capable FTS index.
 
@@ -1276,6 +1277,9 @@ class SessionSearchMixin:
         if role_filter:
             tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             tri_params.extend(role_filter)
+        if user_id_filter is not None:
+            tri_where.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+            tri_params.extend(user_id_filter)
         tri_sql = f"""
             SELECT
                 m.id,
@@ -1315,6 +1319,7 @@ class SessionSearchMixin:
         sort: str = None,
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
+        user_id_filter: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -1323,6 +1328,11 @@ class SessionSearchMixin:
         session_search investigation needed trace archaeology to discover
         the LIKE full scans; this makes the next regression a grep).
         Threshold: HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call).
+
+        ``user_id_filter`` restricts matches to messages whose owning
+        session's ``user_id`` is in the given list — mirrors
+        ``source_filter``. Used by the multiplexed gateway's root-store
+        Teams search so a requester only ever sees their own sessions.
         """
         started = time.time()
         rows = None
@@ -1337,6 +1347,7 @@ class SessionSearchMixin:
                 sort=sort,
                 include_inactive=include_inactive,
                 fields=fields,
+                user_id_filter=user_id_filter,
             )
             return rows
         finally:
@@ -1387,6 +1398,7 @@ class SessionSearchMixin:
         sort: str = None,
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
+        user_id_filter: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1473,6 +1485,11 @@ class SessionSearchMixin:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+
+        if user_id_filter is not None:
+            user_id_placeholders = ",".join("?" for _ in user_id_filter)
+            where_clauses.append(f"s.user_id IN ({user_id_placeholders})")
+            params.extend(user_id_filter)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -1567,6 +1584,9 @@ class SessionSearchMixin:
                 if role_filter:
                     cjk_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     cjk_params.extend(role_filter)
+                if user_id_filter is not None:
+                    cjk_where.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+                    cjk_params.extend(user_id_filter)
                 cjk_sql = f"""
                     SELECT
                         m.id,
@@ -1656,6 +1676,9 @@ class SessionSearchMixin:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if user_id_filter is not None:
+                    tri_where.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+                    tri_params.extend(user_id_filter)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -1750,6 +1773,9 @@ class SessionSearchMixin:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if user_id_filter is not None:
+                    like_where.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+                    like_params.extend(user_id_filter)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -1809,6 +1835,7 @@ class SessionSearchMixin:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    user_id_filter=user_id_filter,
                 )
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
@@ -1849,6 +1876,7 @@ class SessionSearchMixin:
                     role_filter=role_filter,
                     limit=limit,
                     offset=offset,
+                    user_id_filter=user_id_filter,
                 )
                 if cjk_fb:
                     matches = cjk_fb
@@ -1866,6 +1894,7 @@ class SessionSearchMixin:
                     role_filter=role_filter,
                     limit=limit,
                     offset=offset,
+                    user_id_filter=user_id_filter,
                 )
                 if tri_matches:
                     matches = tri_matches
@@ -1958,6 +1987,7 @@ class SessionSearchMixin:
         source_filter: Optional[List[str]] = None,
         exclude_sources: Optional[List[str]] = None,
         role_filter: Optional[List[str]] = None,
+        user_id_filter: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """LIKE-scan the rows the deferred rebuild hasn't indexed yet.
 
@@ -2003,6 +2033,9 @@ class SessionSearchMixin:
         if role_filter:
             where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             params.extend(role_filter)
+        if user_id_filter is not None:
+            where.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+            params.extend(user_id_filter)
 
         sql = f"""
             SELECT m.id, m.session_id, m.role,
