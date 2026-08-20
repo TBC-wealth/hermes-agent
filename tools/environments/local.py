@@ -1715,8 +1715,10 @@ class LocalEnvironment(BaseEnvironment):
 
     _profile_scoped_passthrough = True
 
-    def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
+    def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None,
+                 listener_guard: bool = False):
         cwd = _resolve_local_initial_cwd(cwd)
+        self.listener_guard = listener_guard
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
 
@@ -1792,6 +1794,9 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        if self.listener_guard and not _IS_WINDOWS:
+            guard = Path(__file__).resolve().parents[1] / "listener_guard.py"
+            args = [sys.executable, str(guard), "--", *args]
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
