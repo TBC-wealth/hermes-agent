@@ -359,6 +359,11 @@ DEFAULT_CONFIG = {
         # Enabled by default for non-local backends (SSH); local is always opt-in
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
+        # Optional Linux kernel boundary for local terminal children. When
+        # enabled, listen(2) is denied before the shell starts and remains
+        # denied after exec and in every descendant. Outbound connect(2)
+        # remains available.
+        "listener_guard": False,
     },
 
     "web": {
