@@ -33,6 +33,9 @@ Usage:
     result = terminal_tool("python server.py", background=True)
 """
 
+import base64
+import binascii
+import hashlib
 import importlib.util
 import json
 import logging
@@ -52,6 +55,56 @@ from typing import Optional, Dict, Any, List
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+_MIN_INLINE_BASE64_CHARS = 4096
+_BASE64_BODY_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
+
+
+def _omit_inline_binary_base64(output: str) -> str:
+    """Replace a large, bare base64 payload with non-reversible metadata.
+
+    Terminal output is persisted in session history. Printing a PDF or other
+    binary as base64 therefore stores the whole document in the transcript and
+    sends it back through the model context. A preview is still document data,
+    so this guard omits the payload completely instead of using the ordinary
+    head/tail truncation path.
+
+    Only a complete bare payload is handled here. Short identifiers and normal
+    prose are unchanged; structured tool protocols that intentionally carry
+    binary data own their own decoding/materialisation boundary.
+    """
+    compact = "".join(output.split())
+    if len(compact) < _MIN_INLINE_BASE64_CHARS:
+        return output
+    if len(compact) % 4 or _BASE64_BODY_RE.fullmatch(compact) is None:
+        return output
+    try:
+        decoded = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError):
+        return output
+    if len(decoded) < 1024:
+        return output
+
+    media_type = "application/octet-stream"
+    if decoded.startswith(b"%PDF-"):
+        media_type = "application/pdf"
+    elif decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    elif decoded.startswith(b"\xff\xd8\xff"):
+        media_type = "image/jpeg"
+    elif decoded.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        media_type = "application/zip"
+
+    digest = hashlib.sha256(decoded).hexdigest()
+    return (
+        "[binary base64 output omitted from transcript]"
+        f"\nmedia_type: {media_type}"
+        f"\ndecoded_bytes: {len(decoded)}"
+        f"\nsha256: {digest}"
+        "\nWrite binary data directly to a private file and deliver it through "
+        "the platform's file-attachment path; do not print base64."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3036,6 +3089,11 @@ def terminal_tool(
                         break
             except Exception:
                 pass
+
+            # Binary bodies do not belong in model context or durable session
+            # history. This runs before ordinary truncation because even a
+            # head/tail preview retains chunks of the underlying document.
+            output = _omit_inline_binary_base64(output)
             
             # Truncate output if too long, keeping both head and tail
             from tools.tool_output_limits import get_max_bytes
