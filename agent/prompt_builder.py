@@ -1837,6 +1837,22 @@ def _build_skills_system_prompt_for_home(
     if not skills_by_category:
         result = ""
     else:
+        can_manage_skills = (
+            available_tools is None or "skill_manage" in available_tools
+        )
+        if can_manage_skills:
+            maintenance_guidance = (
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+            )
+        else:
+            maintenance_guidance = (
+                "This profile's reviewed skill catalog is read-only. If a loaded skill "
+                "appears incomplete or outdated, report the exact issue instead of "
+                "attempting to modify or save a skill.\n"
+            )
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
@@ -1876,11 +1892,8 @@ def _build_skills_system_prompt_for_home(
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
+            + maintenance_guidance
+            + "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"

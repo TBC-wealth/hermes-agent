@@ -18,6 +18,7 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    check_skill_manage_requirements,
     skill_manage,
 )
 from agent.skill_utils import (
@@ -68,6 +69,61 @@ description: Use when deploying multi-region Kubernetes clusters with custom CNI
 
 Step 1.
 """
+
+
+class TestSkillManageRequirements:
+    def test_defaults_enabled_for_backward_compatibility(self):
+        with patch("tools.skill_manager_tool.load_config", return_value={}):
+            assert check_skill_manage_requirements() is True
+
+    @pytest.mark.parametrize("value", [False, "false", "0", "no"])
+    def test_explicit_false_hides_mutating_tool(self, value):
+        with patch(
+            "tools.skill_manager_tool.load_config",
+            return_value={"skills": {"manage_enabled": value}},
+        ):
+            assert check_skill_manage_requirements() is False
+
+    def test_config_error_fails_closed(self):
+        with patch(
+            "tools.skill_manager_tool.load_config",
+            side_effect=RuntimeError("unavailable"),
+        ):
+            assert check_skill_manage_requirements() is False
+
+    def test_direct_manage_call_is_blocked_for_read_only_profile(self):
+        with patch(
+            "tools.skill_manager_tool.load_config",
+            return_value={"skills": {"manage_enabled": False}},
+        ):
+            result = json.loads(skill_manage(
+                action="create",
+                name="blocked",
+                content=VALID_SKILL_CONTENT,
+            ))
+        assert result["success"] is False
+        assert "disabled for this profile" in result["error"]
+
+    def test_registry_exposes_read_tools_but_hides_manage(self):
+        # Importing the read-side module registers skills_list and skill_view.
+        import tools.skills_tool  # noqa: F401
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        invalidate_check_fn_cache()
+        try:
+            with patch(
+                "tools.skill_manager_tool.load_config",
+                return_value={"skills": {"manage_enabled": False}},
+            ):
+                definitions = registry.get_definitions(
+                    {"skills_list", "skill_view", "skill_manage"},
+                    quiet=True,
+                )
+        finally:
+            invalidate_check_fn_cache()
+
+        names = {item["function"]["name"] for item in definitions}
+        assert names == {"skills_list", "skill_view"}
 
 
 # ---------------------------------------------------------------------------

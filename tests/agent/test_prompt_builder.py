@@ -293,6 +293,44 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_read_only_catalog_omits_skill_mutation_guidance(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "desk" / "blocktrades"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: blocktrades\ndescription: Show buys and sells\n---\n"
+        )
+
+        result = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view"},
+            available_toolsets={"skills"},
+        )
+
+        assert "blocktrades" in result
+        assert "read-only" in result
+        assert "skill_manage" not in result
+        assert "offer to save as a skill" not in result
+
+    def test_editor_catalog_retains_skill_mutation_guidance(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "desk" / "blocktrades"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: blocktrades\ndescription: Show buys and sells\n---\n"
+        )
+
+        result = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view", "skill_manage"},
+            available_toolsets={"skills"},
+        )
+
+        assert "skill_manage(action='patch')" in result
+        assert "offer to save as a skill" in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
@@ -919,5 +957,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

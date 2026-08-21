@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home, display_hermes_home
 from utils import atomic_write_text, is_truthy_value
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config
 from agent.skill_utils import (
     extract_skill_description,
     is_skill_description_truncated_for_prompt,
@@ -55,6 +55,24 @@ logger = logging.getLogger(__name__)
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
     "background_review_read_paths", default=frozenset()
 )
+
+
+def check_skill_manage_requirements() -> bool:
+    """Return whether the mutating ``skill_manage`` tool is enabled.
+
+    ``skills.manage_enabled`` separates read-only skill consumers from skill
+    editors without hiding ``skills_list`` or ``skill_view``. The setting
+    defaults to the historical enabled behavior when absent, but config-load
+    failures hide the mutating tool.
+    """
+    try:
+        cfg = load_config()
+        return is_truthy_value(
+            cfg_get(cfg, "skills", "manage_enabled"),
+            default=True,
+        )
+    except Exception:
+        return False
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -1527,6 +1545,13 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    if not check_skill_manage_requirements():
+        return tool_error(
+            "Skill management is disabled for this profile; reviewed skills "
+            "remain available through skills_list and skill_view.",
+            success=False,
+        )
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -1764,5 +1789,6 @@ registry.register(
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into")),
+    check_fn=check_skill_manage_requirements,
     emoji="📝",
 )

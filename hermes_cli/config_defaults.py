@@ -1794,6 +1794,11 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Expose skill listing/viewing while optionally withholding the
+        # mutating skill_manage tool. This supports managed profiles that
+        # consume a reviewed, read-only external catalog. Default true
+        # preserves the existing single-user behavior.
+        "manage_enabled": True,
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
