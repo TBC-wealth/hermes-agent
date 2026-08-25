@@ -1348,6 +1348,7 @@ def run_conversation(
     failed = False
     codex_ack_continuations = 0
     length_continue_retries = 0
+    structured_reasoning_length_retried = False
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
@@ -2943,16 +2944,72 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    _has_structured_reasoning = bool(
+                        getattr(_trunc_msg, "reasoning", None)
+                        or getattr(_trunc_msg, "reasoning_content", None)
+                        or getattr(_trunc_msg, "reasoning_details", None)
+                    )
+                    _structured_reasoning_exhausted = (
+                        not _trunc_has_tool_calls
+                        and _has_structured_reasoning
+                        and not (_trunc_content or "").strip()
+                    )
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
-                        and _has_think_tags
                         and (
-                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
+                            _structured_reasoning_exhausted
+                            or (
+                                _has_think_tags
+                                and (
+                                    _trunc_content is not None
+                                    and not agent._has_content_after_think_block(
+                                        _trunc_content
+                                    )
+                                )
+                            )
                         )
                     )
 
                     if _thinking_exhausted:
+                        if (
+                            _structured_reasoning_exhausted
+                            and not structured_reasoning_length_retried
+                        ):
+                            # Structured reasoning fields used to bypass the
+                            # inline <think> detector and enter four generic
+                            # continuation attempts (4K→8K→16K→32K). Give the
+                            # model one materially different, tool-first retry
+                            # directly at the useful 32K cap. Do not replay the
+                            # potentially hundreds-of-KB reasoning payload.
+                            structured_reasoning_length_retried = True
+                            length_continue_retries = 3
+                            messages.append({
+                                "role": "assistant",
+                                "content": "(reasoning exhausted before producing an answer)",
+                                "_length_recovery_synthetic": True,
+                            })
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "[System: Your previous attempt used the entire "
+                                    "output budget on internal reasoning and produced "
+                                    "no answer. Continue once now. Do not restate the "
+                                    "analysis. If tools are needed, call them "
+                                    "immediately; otherwise give the concise final "
+                                    "answer.]"
+                                ),
+                                "_length_recovery_synthetic": True,
+                            })
+                            agent._session_messages = messages
+                            agent._vprint(
+                                f"{agent.log_prefix}↻ Structured reasoning exhausted "
+                                "the output budget — retrying once at 32K with a "
+                                "tool-first continuation...",
+                                force=True,
+                            )
+                            _retry.restart_with_length_continuation = True
+                            break
+
                         _exhaust_error = (
                             "Model used all output tokens on reasoning with none left "
                             "for the response. Try lowering reasoning effort or "

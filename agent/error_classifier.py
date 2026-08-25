@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from agent.errors import ProviderStaleStreamError
+
 logger = logging.getLogger(__name__)
 
 
@@ -943,7 +945,18 @@ def classify_api_error(
             )
         return _result(FailoverReason.timeout, retryable=True)
 
-    # ── 7b. Stale-call circuit breaker → failover immediately ──────
+    # ── 7b. Zero-chunk stale watchdog → failover immediately ───────
+    # The watchdog already waited the full provider-specific stale window.
+    # Repeating the same request/model through the generic retry ladder costs
+    # another full window and has repeatedly reproduced the Xiaomi stall.
+    if isinstance(error, ProviderStaleStreamError):
+        return _result(
+            FailoverReason.timeout,
+            retryable=False,
+            should_fallback=True,
+        )
+
+    # ── 7c. Stale-call circuit breaker → failover immediately ──────
     # _check_stale_giveup() in agent/chat_completion_helpers.py raises a
     # RuntimeError when the provider has been unresponsive for N
     # consecutive stale attempts (default 5).  The error is NOT a transport

@@ -10,6 +10,7 @@ from agent.error_classifier import (
     _extract_error_code,
     _classify_402,
 )
+from agent.errors import ProviderStaleStreamError
 
 
 # ── Helper: mock API errors ────────────────────────────────────────────
@@ -985,6 +986,19 @@ class Test408RequestTimeout:
         assert result.should_fallback is True
         assert result.should_compress is False
 
+    def test_zero_chunk_watchdog_error_triggers_fallback_not_retry(self):
+        result = classify_api_error(
+            ProviderStaleStreamError(
+                "Provider stream produced no chunks before the stale watchdog aborted"
+            ),
+            provider="xiaomi",
+            model="mimo-v2.5-pro",
+        )
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
 
 # ── Test: throttle vs overflow disambiguation + new overflow shapes ─────
 # Port of anomalyco/opencode#37848 (expand context overflow patterns +
@@ -1047,6 +1061,5 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
 

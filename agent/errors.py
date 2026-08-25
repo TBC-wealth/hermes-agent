@@ -9,5 +9,17 @@ class EmptyStreamError(RuntimeError):
     pass
 
 
+class ProviderStaleStreamError(RuntimeError):
+    """The stream watchdog aborted a request that produced zero chunks.
+
+    This is distinct from an incidental socket/read timeout: retrying the same
+    model immediately already consumed the full stale window and commonly
+    repeats the stall. The conversation loop may activate a configured
+    fallback without burning its generic retry ladder.
+    """
+
+    pass
+
+
 class MoAPresetNotFoundError(ValueError):
     """Raised when a persisted MoA preset no longer exists in config."""

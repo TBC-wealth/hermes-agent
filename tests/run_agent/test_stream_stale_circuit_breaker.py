@@ -21,6 +21,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from types import SimpleNamespace
+from agent.errors import ProviderStaleStreamError
 
 
 def _make_anthropic_agent(**kwargs):
@@ -124,7 +125,7 @@ class TestStreamStaleCircuitBreaker:
         # unblock on the abort to simulate the socket shutdown waking the read.
         agent._abort_request_anthropic_client = lambda *a, **k: unblock.set()
 
-        with pytest.raises(Exception):
+        with pytest.raises(ProviderStaleStreamError):
             agent._interruptible_streaming_api_call({})
 
         # At least one stale kill happened; the streak must have advanced.

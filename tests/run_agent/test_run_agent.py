@@ -25,6 +25,7 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
+from agent.errors import ProviderStaleStreamError
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
@@ -3180,6 +3181,38 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Fallback answer."
 
+    def test_zero_chunk_stale_switches_fallback_without_generic_retries(self, agent):
+        """One watchdog window is enough before moving from MiMo Pro to MiMo."""
+        self._setup_agent(agent)
+        agent.provider = "xiaomi"
+        agent.model = "mimo-v2.5-pro"
+        agent._fallback_chain = [{"provider": "xiaomi", "model": "mimo-v2.5"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+        agent.client.chat.completions.create.side_effect = [
+            ProviderStaleStreamError("zero chunks before stale watchdog abort"),
+            _mock_response(content="Recovered on MiMo 2.5", finish_reason="stop"),
+        ]
+
+        def _mock_fallback():
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.model = "mimo-v2.5"
+            return True
+
+        with (
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback) as activate,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered on MiMo 2.5"
+        assert agent.client.chat.completions.create.call_count == 2
+        activate.assert_called_once_with()
+
     def test_empty_response_fallback_also_empty_returns_empty(self, agent):
         """If fallback also returns empty, final response is (empty)."""
         self._setup_agent(agent)
@@ -3820,6 +3853,69 @@ class TestRunConversation:
         assert result["final_response"] is not None
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
+
+    def test_structured_reasoning_length_gets_one_direct_32k_tool_first_retry(self, agent):
+        """Structured reasoning exhaustion must skip the 8K/16K retry ladder."""
+        self._setup_agent(agent)
+        agent.max_tokens = 4096
+        requested_caps = []
+
+        def _fake_build_api_kwargs(api_messages):
+            ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+            if ephemeral is not None:
+                agent._ephemeral_max_output_tokens = None
+            cap = ephemeral if ephemeral is not None else agent.max_tokens
+            requested_caps.append(cap)
+            return {"model": agent.model, "messages": api_messages, "max_tokens": cap}
+
+        exhausted = _mock_response(
+            content="",
+            finish_reason="length",
+            reasoning_content="private chain of thought " * 1000,
+        )
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        done = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exhausted, tool_turn, done]
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=_fake_build_api_kwargs),
+            patch("run_agent.handle_function_call", return_value="result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("research this")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Done"
+        assert requested_caps[:2] == [4096, 32768]
+        second_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert "call them immediately" in second_messages[-1]["content"]
+        assert not any("reasoning_content" in message for message in second_messages)
+
+    def test_repeated_structured_reasoning_length_stops_after_one_retry(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 4096
+        exhausted = _mock_response(
+            content="", finish_reason="length", reasoning="reasoning only"
+        )
+        agent.client.chat.completions.create.side_effect = [exhausted, exhausted]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["api_calls"] == 2
+        assert agent.client.chat.completions.create.call_count == 2
+        assert "reasoning" in result["error"].lower()
 
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
@@ -5923,4 +6019,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-

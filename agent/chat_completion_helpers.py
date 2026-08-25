@@ -30,7 +30,7 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
-from agent.errors import EmptyStreamError
+from agent.errors import EmptyStreamError, ProviderStaleStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -2932,6 +2932,7 @@ def interruptible_streaming_api_call(
     stream_attempt_state = {
         "current": 0,
         "cancelled": set(),
+        "stale_killed": set(),
         "discarded_chunks": 0,
         "discarded_bytes": 0,
     }
@@ -2970,6 +2971,16 @@ def interruptible_streaming_api_call(
                 current,
                 reason,
             )
+
+    def _mark_current_stream_attempt_stale() -> None:
+        with stream_attempt_lock:
+            current = int(stream_attempt_state.get("current") or 0)
+            if current:
+                stream_attempt_state["stale_killed"].add(current)
+
+    def _stream_attempt_was_stale_killed(stream_attempt_id: int) -> bool:
+        with stream_attempt_lock:
+            return stream_attempt_id in stream_attempt_state["stale_killed"]
 
     def _stream_attempt_is_active(stream_attempt_id: int) -> bool:
         with stream_attempt_lock:
@@ -3795,6 +3806,18 @@ def interruptible_streaming_api_call(
                             type(e).__name__,
                         )
                         return
+                    # The watchdog deliberately closed this request after a
+                    # full zero-chunk stale window. The socket layer usually
+                    # reports only BrokenPipe/ReadError here, which used to
+                    # erase the cause and trigger more attempts against the
+                    # same stalled model. Preserve the cause so the outer
+                    # recovery loop can activate a configured fallback now.
+                    if _stream_attempt_was_stale_killed(stream_attempt_id):
+                        result["error"] = ProviderStaleStreamError(
+                            "Provider stream produced no chunks before the "
+                            "stale watchdog aborted the request"
+                        )
+                        return
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
@@ -4265,6 +4288,7 @@ def interruptible_streaming_api_call(
                 f"Reconnecting..."
             )
             try:
+                _mark_current_stream_attempt_stale()
                 _cancel_current_stream_attempt("stale_stream_kill")
                 _close_request_client_once("stale_stream_kill")
             except Exception:
