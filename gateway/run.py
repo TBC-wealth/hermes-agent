@@ -1797,6 +1797,9 @@ from contextlib import contextmanager as _contextmanager
 # profile (SecondaryPortBindingConfigError) so a single bad profile cannot
 # take down the whole multiplexer. The set lives in gateway.config so the
 # dashboard's pre-write validation enforces the same policy.
+import uuid
+
+from agent import actor_context as _actor_context
 from gateway.config import (
     PORT_BINDING_PLATFORM_VALUES as _PORT_BINDING_PLATFORM_VALUES,
     platform_binds_port as _platform_binds_port,
@@ -24071,19 +24074,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        # Establish the actor for this turn: the platform user Hermes verified,
+        # the profile it routed to, the session and a turn identifier. Carried on
+        # a ContextVar so concurrent turns in this process each see their own,
+        # and ended on every exit path including cancellation.
+        actor = _actor_context.ActorContext(
+            user_id=str(getattr(source, "user_id", "") or ""),
+            profile=str(self._profile_name_for_source(source) or ""),
+            session_id=str(session_id or ""),
+            turn_id=uuid.uuid4().hex,
+            platform=str(
+                getattr(getattr(source, "platform", None), "value", None)
+                or getattr(source, "platform", "") or ""
+            ),
+        )
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
-            )
+            with _actor_context.actor_turn(actor):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    message_type=message_type,
+                )
 
         profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
+        with _profile_runtime_scope(profile_home), _actor_context.actor_turn(actor):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,

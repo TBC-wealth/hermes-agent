@@ -43,6 +43,7 @@ import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from agent import actor_context
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -733,6 +734,11 @@ class ProcessRegistry:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                # This turn's actor stamp, and only this turn's: anything
+                # inherited from the gateway or left over from another turn is
+                # stripped first. No-op unless a host installed the hook.
+                pty_env = actor_context.sanitize_inherited(pty_env)
+                pty_env.update(actor_context.process_environment())
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
                     [user_shell, "-lic", f"set +m; {safe_command}"],
@@ -742,6 +748,11 @@ class ProcessRegistry:
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
+                # Bind the REAL child, never the gateway: several turns share
+                # this process, and binding its PID would make them identical.
+                actor_context.bind_spawned_process(
+                    session.pid, session.host_start_time
+                )
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
@@ -775,6 +786,8 @@ class ProcessRegistry:
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env = actor_context.sanitize_inherited(bg_env)
+        bg_env.update(actor_context.process_environment())
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
@@ -795,6 +808,7 @@ class ProcessRegistry:
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        actor_context.bind_spawned_process(session.pid, session.host_start_time)
 
         try:
             # Start output reader thread
