@@ -155,7 +155,7 @@ class TestRecoveryDoesNotLeakMediaFragments:
         )
 
         event = _make_event(Platform.DISCORD)
-        with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
+        with caplog.at_level(logging.WARNING, logger="gateway.platforms.base"):
             await adapter._process_message_background(
                 event, build_session_key(event.source)
             )
@@ -166,20 +166,22 @@ class TestRecoveryDoesNotLeakMediaFragments:
             if "vacation" in s["content"] or "photo" in s["content"] or "MEDIA" in s["content"]
         ]
         assert leaked == [], f"media-path fragment leaked to user: {leaked}"
-        # The genuinely-undeliverable response is logged loudly, not silent.
+        # A path-free notice reaches the user and recovery is observable.
+        assert len(adapter.sent) == 1
+        assert "safely deliver" in adapter.sent[0]["content"]
         assert any(
-            "response_delivery_dropped" in r.getMessage()
-            for r in caplog.records if r.levelno == logging.ERROR
+            "response_delivery_recovered" in r.getMessage()
+            for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
 
-class TestUnrecoverableDropIsLoud:
-    """A non-empty response that produces NOTHING deliverable (sanitizes to
-    empty, no attachment) must log a response_delivery_dropped ERROR rather
-    than vanishing silently."""
+class TestUnrecoverableDropIsVisible:
+    """A directive-only response with no safe attachment must notify the user."""
 
     @pytest.mark.asyncio
-    async def test_directive_only_response_logs_dropped(self, monkeypatch, caplog):
+    async def test_directive_only_response_sends_path_free_notice(
+        self, monkeypatch, caplog
+    ):
         adapter = _DummyAdapter(Platform.DISCORD)
         adapter._keep_typing = _hold_typing
 
@@ -191,15 +193,18 @@ class TestUnrecoverableDropIsLoud:
         _strip_everything(adapter, monkeypatch)
 
         event = _make_event(Platform.DISCORD)
-        with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
+        with caplog.at_level(logging.WARNING, logger="gateway.platforms.base"):
             await adapter._process_message_background(
                 event, build_session_key(event.source)
             )
 
-        assert adapter.sent == []
+        assert len(adapter.sent) == 1
+        assert "safely deliver" in adapter.sent[0]["content"]
+        assert "missing.ogg" not in adapter.sent[0]["content"]
+        assert "MEDIA" not in adapter.sent[0]["content"]
         assert any(
-            "response_delivery_dropped" in r.getMessage()
-            for r in caplog.records if r.levelno == logging.ERROR
+            "response_delivery_recovered" in r.getMessage()
+            for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
 

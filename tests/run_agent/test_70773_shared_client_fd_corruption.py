@@ -30,6 +30,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from agent.errors import ProviderStaleStreamError
 from tests.run_agent.test_streaming import _make_stream_chunk
 
 
@@ -65,7 +66,8 @@ class TestStaleWatchdogNeverClosesSharedClient:
         self, mock_close, mock_create, mock_abort, mock_replace, monkeypatch,
     ):
         """Stale-stream watchdog fires → request-local client is aborted, the
-        shared primary is never replaced (poll thread must not close it)."""
+        shared primary is never replaced, and the stale error is handed to the
+        outer provider-fallback loop (poll thread must not close it)."""
         monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.05")
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
 
@@ -81,29 +83,15 @@ class TestStaleWatchdogNeverClosesSharedClient:
                 raise httpx.ConnectError("connection dropped after abort")
                 yield  # pragma: no cover — make this a generator
 
-        retry_chunks = [
-            _make_stream_chunk(content="recovered"),
-            _make_stream_chunk(finish_reason="stop", model="test/model"),
-        ]
-
-        class RetryStream:
-            response = SimpleNamespace(headers={})
-
-            def __iter__(self):
-                return iter(retry_chunks)
-
         mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = [
-            StaleThenDeadStream(),
-            RetryStream(),
-        ]
+        mock_client.chat.completions.create.return_value = StaleThenDeadStream()
         mock_create.return_value = mock_client
         mock_abort.side_effect = lambda *a, **k: unblock.set()
 
         agent = _make_agent()
-        response = agent._interruptible_streaming_api_call({})
+        with pytest.raises(ProviderStaleStreamError):
+            agent._interruptible_streaming_api_call({})
 
-        assert response.choices[0].message.content == "recovered"
         # The watchdog aborted the request-local client from the poll thread…
         assert mock_abort.call_count >= 1
         # …and NEVER replaced/closed the shared primary client (#70773).
@@ -236,4 +224,3 @@ class TestReplacePrimaryRetiresInsteadOfClosing:
             agent._retire_shared_openai_client(client, reason="unit_test")
 
         client.close.assert_not_called()
-

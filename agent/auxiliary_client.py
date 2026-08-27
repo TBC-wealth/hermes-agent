@@ -2467,6 +2467,34 @@ def _warn_paid_lane_once(model: str) -> None:
 def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
+    pool_present, entry = _select_pool_entry("openrouter")
+    if pool_present:
+        or_key = explicit_api_key or _pool_runtime_api_key(entry)
+        base_url = (
+            _pool_runtime_base_url(entry, OPENROUTER_BASE_URL)
+            or OPENROUTER_BASE_URL
+        )
+        if not or_key:
+            # Pool exists but is exhausted (no usable runtime key) — fall
+            # through to the standard OpenRouter environment path rather than
+            # reusing endpoint metadata from an unusable pool entry.
+            logger.debug(
+                "Auxiliary client: OpenRouter pool exhausted, trying "
+                "OPENROUTER_API_KEY"
+            )
+            base_url = OPENROUTER_BASE_URL
+    else:
+        or_key = None
+        base_url = OPENROUTER_BASE_URL
+
+    or_key = or_key or explicit_api_key or _scoped_key_env("OPENROUTER_API_KEY")
+    if not or_key:
+        # An optional fallback not being configured is normal. In particular,
+        # availability probes run on every gateway turn; classifying this as a
+        # payment failure floods logs and obscures real 402s.
+        logger.debug("Auxiliary client: OpenRouter not configured")
+        return None, None
+
     if free_only and not _is_free_model(or_model):
         logger.warning(
             "Auxiliary client: auxiliary.free_only is enabled but the "
@@ -2476,29 +2504,12 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             "auxiliary.free_only.",
             or_model,
         )
-        _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     if not _is_free_model(or_model):
         _warn_paid_lane_once(or_model)
 
-    pool_present, entry = _select_pool_entry("openrouter")
-    if pool_present:
-        or_key = explicit_api_key or _pool_runtime_api_key(entry)
-        if or_key:
-            base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
-            logger.debug("Auxiliary client: OpenRouter via pool")
-            return _create_openai_client(api_key=or_key, base_url=base_url,
-                           default_headers=build_or_headers()), or_model
-        # Pool exists but is exhausted (no usable runtime key) — fall through to
-        # the OPENROUTER_API_KEY env-var path rather than failing outright.
-        logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
-
-    or_key = explicit_api_key or _scoped_key_env("OPENROUTER_API_KEY")
-    if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
-        return None, None
     logger.debug("Auxiliary client: OpenRouter")
-    return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
+    return _create_openai_client(api_key=or_key, base_url=base_url,
                    default_headers=build_or_headers()), or_model
 
 
@@ -2535,11 +2546,10 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     nous = _read_nous_auth()
     runtime = _resolve_nous_runtime_api(force_refresh=False)
     if runtime is None and not nous:
-        logger.warning(
+        logger.debug(
             "Auxiliary Nous client unavailable: no Nous authentication found "
             "(run: hermes auth)."
         )
-        _mark_provider_unhealthy("nous", ttl=60)
         return None, None
     if runtime is None and nous:
         logger.debug(
@@ -2583,11 +2593,10 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     else:
         api_key = _nous_api_key(nous or {})
         if not api_key:
-            logger.warning(
+            logger.debug(
                 "Auxiliary Nous client unavailable: no usable inference JWT found "
                 "(run: hermes auth add nous)."
             )
-            _mark_provider_unhealthy("nous", ttl=60)
             return None, None
         base_url = str((nous or {}).get("inference_base_url") or _nous_base_url()).rstrip("/")
     return (
@@ -5848,7 +5857,10 @@ def resolve_provider_client(
     if provider == "openrouter":
         client, default = _try_openrouter(explicit_api_key=explicit_api_key)
         if client is None:
-            logger.warning(
+            # Provider resolution doubles as an availability probe for
+            # optional auxiliary lanes.  An unconfigured lane is normal and
+            # should not manufacture a per-turn production warning.
+            logger.debug(
                 "resolve_provider_client: openrouter requested but %s",
                 _describe_openrouter_unavailable(),
             )
@@ -5868,8 +5880,8 @@ def resolve_provider_client(
         )
         client, default = _try_nous(vision=_is_vision)
         if client is None:
-            logger.warning("resolve_provider_client: nous requested "
-                           "but Nous Portal not configured (run: hermes auth)")
+            logger.debug("resolve_provider_client: nous requested "
+                         "but Nous Portal not configured (run: hermes auth)")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         # Dual-wire: anthropic/* → /v1/messages, everything else stays on

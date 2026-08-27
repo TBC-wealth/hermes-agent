@@ -3812,7 +3812,15 @@ def interruptible_streaming_api_call(
                     # erase the cause and trigger more attempts against the
                     # same stalled model. Preserve the cause so the outer
                     # recovery loop can activate a configured fallback now.
-                    if _stream_attempt_was_stale_killed(stream_attempt_id):
+                    _attempt_diag = request_client_holder.get("diag")
+                    _attempt_received_chunks = bool(
+                        isinstance(_attempt_diag, dict)
+                        and int(_attempt_diag.get("chunks", 0) or 0) > 0
+                    )
+                    if (
+                        _stream_attempt_was_stale_killed(stream_attempt_id)
+                        and not _attempt_received_chunks
+                    ):
                         result["error"] = ProviderStaleStreamError(
                             "Provider stream produced no chunks before the "
                             "stale watchdog aborted the request"
