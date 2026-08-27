@@ -901,13 +901,7 @@ class TestExpiredCodexFallback:
         import base64
         import time as _time
 
-        # Belt-and-suspenders: _try_openrouter marks openrouter unhealthy
-        # when OPENROUTER_API_KEY is absent (which the preceding test in
-        # this class exercises).  The file-level _clean_env autouse fixture
-        # clears the cache, but fixture ordering with the conftest
-        # _hermetic_environment autouse can leave a narrow window where
-        # the mark reappears.  Explicitly clear here so this test is
-        # independent of run order.
+        # Keep this test independent of earlier explicit health-cache tests.
         import agent.auxiliary_client as _aux_mod
         _aux_mod._aux_unhealthy_until.clear()
         _aux_mod._aux_unhealthy_logged_at.clear()
@@ -1067,6 +1061,56 @@ class TestOpenRouterPaidLaneGuard:
                 _try_openrouter()
         assert not any("PAID lane engaged" in r.getMessage() for r in caplog.records)
         _paid_lane_warned.discard(_OPENROUTER_MODEL)
+
+    def test_missing_credentials_do_not_claim_payment_failure(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}),
+            caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"),
+        ):
+            client, model = _try_openrouter()
+
+        assert (client, model) == (None, None)
+        assert not any("payment / credit" in r.getMessage() for r in caplog.records)
+        assert not any("PAID lane engaged" in r.getMessage() for r in caplog.records)
+
+        caplog.clear()
+        with (
+            patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)),
+            caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"),
+        ):
+            assert resolve_provider_client("openrouter") == (None, None)
+        assert not caplog.records
+
+    def test_missing_nous_auth_does_not_claim_payment_failure(
+        self, caplog
+    ):
+        import logging
+        from agent.auxiliary_client import _try_nous
+
+        with (
+            patch("agent.auxiliary_client._read_nous_auth", return_value=None),
+            patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=None),
+            caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"),
+        ):
+            client, model = _try_nous()
+
+        assert (client, model) == (None, None)
+        assert not any("payment / credit" in r.getMessage() for r in caplog.records)
+        assert not any("no Nous authentication" in r.getMessage() for r in caplog.records)
+
+        caplog.clear()
+        with (
+            patch("agent.auxiliary_client._try_nous", return_value=(None, None)),
+            caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"),
+        ):
+            assert resolve_provider_client("nous") == (None, None)
+        assert not caplog.records
 
     def test_is_free_model(self):
         from agent.auxiliary_client import _is_free_model

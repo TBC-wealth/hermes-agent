@@ -5942,6 +5942,25 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+                    elif _response_pre_extract.strip():
+                        # A directive-only response whose attachment was
+                        # rejected by the path/provenance guard used to leave
+                        # the user with silence. Do not leak the rejected path
+                        # and do not weaken the guard; send a fixed recovery
+                        # notice through the normal delivery + ledger path.
+                        text_content = (
+                            "I couldn't safely deliver that attachment. I'll "
+                            "need to regenerate or stage it in the private job "
+                            "folder before I can resend it."
+                        )
+                        logger.warning(
+                            "[%s] response_delivery_recovered: non-empty "
+                            "directive-only response (%d chars) produced no safe "
+                            "attachment; delivering a path-free notice to %s",
+                            self.name,
+                            len(_response_pre_extract),
+                            event.source.chat_id,
+                        )
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status

@@ -25,3 +25,9 @@ def test_profile_welcome_rejects_a_symlinked_state_directory(tmp_path):
 
     assert _claim_agentsmith_profile_welcome(profile) is False
     assert not (target / "agentsmith-welcome-v1.json").exists()
+
+
+def test_profile_welcome_claim_works_without_posix_euid(tmp_path, monkeypatch):
+    monkeypatch.delattr("gateway.run.os.geteuid")
+
+    assert _claim_agentsmith_profile_welcome(tmp_path / "windows-profile") is True
