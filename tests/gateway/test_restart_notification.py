@@ -393,6 +393,46 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
 
 @pytest.mark.asyncio
+async def test_shutdown_notification_does_not_broadcast_to_idle_home_channel():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="active-42", chat_type="group")
+    session_key = build_session_key(source)
+
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="idle-home-42",
+        name="Ops Home",
+    )
+    runner._running_agents[session_key] = object()
+    # Keep this regression independent of the async session-store executor: the
+    # routing source itself is not under test, only the absence of a second send
+    # to the idle home channel.
+    runner.session_store = None
+    runner._cache_session_source(session_key, source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="shutdown"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[0] == "active-42"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_is_silent_without_an_active_task():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="idle-home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="active-42", chat_type="group", thread_id="topic-7")
@@ -411,5 +451,3 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     await runner._notify_active_sessions_of_shutdown()
 
     adapter.send.assert_not_awaited()
-
-
