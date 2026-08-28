@@ -1590,40 +1590,56 @@ def skill_manage(
     except Exception:
         pass
 
-    if action == "create":
-        if not content:
-            return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+    try:
+        if action == "create":
+            if not content:
+                return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+            result = _create_skill(name, content, category)
 
-    elif action == "edit":
-        if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        elif action == "edit":
+            if not content:
+                return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            result = _edit_skill(name, content)
 
-    elif action == "patch":
-        if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
-        if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        elif action == "patch":
+            if not old_string:
+                return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
+            if new_string is None:
+                return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
-    elif action == "delete":
-        result = _delete_skill(name, absorbed_into=absorbed_into)
+        elif action == "delete":
+            result = _delete_skill(name, absorbed_into=absorbed_into)
 
-    elif action == "write_file":
-        if not file_path:
-            return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
-        if file_content is None:
-            return tool_error("file_content is required for 'write_file'.", success=False)
-        result = _write_file(name, file_path, file_content)
+        elif action == "write_file":
+            if not file_path:
+                return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
+            if file_content is None:
+                return tool_error("file_content is required for 'write_file'.", success=False)
+            result = _write_file(name, file_path, file_content)
 
-    elif action == "remove_file":
-        if not file_path:
-            return tool_error("file_path is required for 'remove_file'.", success=False)
-        result = _remove_file(name, file_path)
+        elif action == "remove_file":
+            if not file_path:
+                return tool_error("file_path is required for 'remove_file'.", success=False)
+            result = _remove_file(name, file_path)
 
-    else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        else:
+            result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+    except OSError as exc:
+        # Managed deployments keep some skill trees root-owned or mounted read-only
+        # (AgentSmith 2026-08-28: a PermissionError traceback here led the agent to
+        # edit its own config.yaml to "fix" it). Report it as an ordinary tool
+        # error with the right next step instead of raising.
+        location = exc.filename or name
+        return {
+            "success": False,
+            "error": (
+                f"Skill '{name}' cannot be modified here: {exc.strerror or exc} ({location}). "
+                "This skill tree is managed read-only in this deployment; propose the change "
+                "through the reviewed skill-publishing path instead of editing files or "
+                "changing write-approval settings."
+            ),
+        }
 
     if result.get("success"):
         # Audit ledger append (best-effort; never blocks the mutation).
