@@ -35,6 +35,7 @@ Directory layout for user skills:
 import json
 import logging
 import re
+import os
 import shutil
 import contextvars as _ctxvars
 from pathlib import Path
@@ -660,6 +661,46 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return _skills_dir() / name
 
 
+_LAST_FORK_NOTE: Optional[str] = None
+
+
+def _fork_external_skill(existing: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """Copy-on-write for skills that live outside the profile's own skills dir.
+
+    Skills under ``skills.external_dirs`` are read-only catalogs (AgentSmith
+    compiles them per profile, root-owned). ``_find_skill`` searches the local
+    ``~/.hermes/skills/`` first, so copying the skill there makes every later
+    lookup - and the prompt - use the editable copy for this profile only. The
+    shared catalog is unchanged until the copy is published through the
+    reviewed path. Without this, every edit of a catalog skill ended in
+    PermissionError and the agent went looking for sudo (2026-08-28: 7 of 9
+    blocked attempts in two weeks were exactly this).
+    """
+    global _LAST_FORK_NOTE
+    _LAST_FORK_NOTE = None
+    path = Path(existing["path"])
+    local_root = _skills_dir()
+    try:
+        path.resolve().relative_to(local_root.resolve())
+        return existing  # already local
+    except ValueError:
+        pass
+    if os.access(path, os.W_OK) and os.access(path / "SKILL.md", os.W_OK):
+        return existing  # external but writable: leave it alone
+    destination = local_root / path.name
+    if not destination.exists():
+        try:
+            shutil.copytree(path, destination, symlinks=False)
+        except OSError as exc:
+            raise OSError(exc.errno, f"could not copy read-only skill into the profile: {exc.strerror}", str(destination)) from exc
+    _LAST_FORK_NOTE = (
+        f"'{name}' lives in a read-only shared catalog; it was copied to your profile "
+        f"({destination}) and edited there. Only your sessions see the change until it is "
+        "published through the reviewed skill-publishing path (skill-publisher skill)."
+    )
+    return {**existing, "path": destination, "forked_from": str(path)}
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
@@ -1005,6 +1046,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    existing = _fork_external_skill(existing, name)
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
     if org_guard:
         return org_guard
@@ -1074,6 +1116,7 @@ def _patch_skill(
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    existing = _fork_external_skill(existing, name)
 
     skill_dir = existing["path"]
     org_guard = _org_mirror_write_guard(name, skill_dir, "patch")
@@ -1309,6 +1352,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    existing = _fork_external_skill(existing, name)
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
     if org_guard:
         return org_guard
@@ -1361,6 +1405,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    existing = _fork_external_skill(existing, name)
 
     skill_dir = existing["path"]
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
@@ -1569,42 +1614,60 @@ def skill_manage(
     if gate_result is not None:
         return gate_result
 
-    if action == "create":
-        if not content:
-            return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+    try:
+        if action == "create":
+            if not content:
+                return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+            result = _create_skill(name, content, category)
 
-    elif action == "edit":
-        if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        elif action == "edit":
+            if not content:
+                return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            result = _edit_skill(name, content)
 
-    elif action == "patch":
-        if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
-        if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        elif action == "patch":
+            if not old_string:
+                return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
+            if new_string is None:
+                return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
-    elif action == "delete":
-        result = _delete_skill(name, absorbed_into=absorbed_into)
+        elif action == "delete":
+            result = _delete_skill(name, absorbed_into=absorbed_into)
 
-    elif action == "write_file":
-        if not file_path:
-            return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
-        if file_content is None:
-            return tool_error("file_content is required for 'write_file'.", success=False)
-        result = _write_file(name, file_path, file_content)
+        elif action == "write_file":
+            if not file_path:
+                return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
+            if file_content is None:
+                return tool_error("file_content is required for 'write_file'.", success=False)
+            result = _write_file(name, file_path, file_content)
 
-    elif action == "remove_file":
-        if not file_path:
-            return tool_error("file_path is required for 'remove_file'.", success=False)
-        result = _remove_file(name, file_path)
+        elif action == "remove_file":
+            if not file_path:
+                return tool_error("file_path is required for 'remove_file'.", success=False)
+            result = _remove_file(name, file_path)
 
-    else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        else:
+            result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+    except OSError as exc:
+        # Managed deployments keep some skill trees root-owned or mounted read-only
+        # (AgentSmith 2026-08-28: a PermissionError traceback here led the agent to
+        # edit its own config.yaml to "fix" it). Report it as an ordinary tool
+        # error with the right next step instead of raising.
+        location = exc.filename or name
+        return {
+            "success": False,
+            "error": (
+                f"Skill '{name}' cannot be modified here: {exc.strerror or exc} ({location}). "
+                "This skill tree is managed read-only in this deployment; propose the change "
+                "through the reviewed skill-publishing path instead of editing files or "
+                "changing write-approval settings."
+            ),
+        }
 
     if result.get("success"):
+        if _LAST_FORK_NOTE:
+            result["note"] = _LAST_FORK_NOTE
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             clear_skills_system_prompt_cache(clear_snapshot=True)
