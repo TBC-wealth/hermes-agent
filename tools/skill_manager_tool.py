@@ -34,6 +34,7 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import contextvars as _ctxvars
@@ -642,6 +643,46 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return _skills_dir() / name
 
 
+_LAST_FORK_NOTE: Optional[str] = None
+
+
+def _fork_external_skill(existing: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """Copy-on-write for skills that live outside the profile's own skills dir.
+
+    Skills under ``skills.external_dirs`` are read-only catalogs (AgentSmith
+    compiles them per profile, root-owned). ``_find_skill`` searches the local
+    ``~/.hermes/skills/`` first, so copying the skill there makes every later
+    lookup - and the prompt - use the editable copy for this profile only. The
+    shared catalog is unchanged until the copy is published through the
+    reviewed path. Without this, every edit of a catalog skill ended in
+    PermissionError and the agent went looking for sudo (2026-08-28: 7 of 9
+    blocked attempts in two weeks were exactly this).
+    """
+    global _LAST_FORK_NOTE
+    _LAST_FORK_NOTE = None
+    path = Path(existing["path"])
+    local_root = _skills_dir()
+    try:
+        path.resolve().relative_to(local_root.resolve())
+        return existing  # already local
+    except ValueError:
+        pass
+    if os.access(path, os.W_OK) and os.access(path / "SKILL.md", os.W_OK):
+        return existing  # external but writable: leave it alone
+    destination = local_root / path.name
+    if not destination.exists():
+        try:
+            shutil.copytree(path, destination, symlinks=False)
+        except OSError as exc:
+            raise OSError(exc.errno, f"could not copy read-only skill into the profile: {exc.strerror}", str(destination)) from exc
+    _LAST_FORK_NOTE = (
+        f"'{name}' lives in a read-only shared catalog; it was copied to your profile "
+        f"({destination}) and edited there. Only your sessions see the change until it is "
+        "published through the reviewed skill-publishing path (skill-publisher skill)."
+    )
+    return {**existing, "path": destination, "forked_from": str(path)}
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
@@ -1016,6 +1057,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    existing = _fork_external_skill(existing, name)
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
     if org_guard:
         return org_guard
@@ -1085,6 +1127,7 @@ def _patch_skill(
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    existing = _fork_external_skill(existing, name)
 
     skill_dir = existing["path"]
     org_guard = _org_mirror_write_guard(name, skill_dir, "patch")
@@ -1320,6 +1363,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    existing = _fork_external_skill(existing, name)
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
     if org_guard:
         return org_guard
@@ -1372,6 +1416,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    existing = _fork_external_skill(existing, name)
 
     skill_dir = existing["path"]
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
@@ -1642,6 +1687,8 @@ def skill_manage(
         }
 
     if result.get("success"):
+        if _LAST_FORK_NOTE:
+            result["note"] = _LAST_FORK_NOTE
         # Audit ledger append (best-effort; never blocks the mutation).
         try:
             from tools import skill_ledger as _ledger
